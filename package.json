@@ -1,0 +1,14 @@
+{
+  "name": "openyard-hooks",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2",
+    "stripe": "^16.0.0",
+    "pino": "^9.3.2",
+    "pino-http": "^9.0.0",
+    "raw-body": "^2.5.2"
+  }
+}
