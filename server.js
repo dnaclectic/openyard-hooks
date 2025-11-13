@@ -20,21 +20,33 @@ app.use(pinoHttp({ logger: log }));
 // Health
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 
-// Inbound SMS -> forward to Make
-app.post("/webhooks/telnyx", express.json(), async (req, res) => {
-  try {
-    const payload = { headers: { "x-source": "twilio" }, body: req.body };
-    fetch(MAKE_TELNYX_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload)
-    }).catch(() => {});
-    res.sendStatus(200);
-  } catch (e) {
-    req.log.error(e, "sms webhook error");
-    res.sendStatus(200);
+// Inbound SMS -> forward to Make (Twilio-style form payload)
+app.post(
+  "/webhooks/telnyx",
+  express.urlencoded({ extended: false }),
+  async (req, res) => {
+    try {
+      // req.body is now the Twilio-style form object (Body, From, To, etc.)
+      const params = new URLSearchParams(req.body);
+
+      log.info({ body: req.body }, "incoming sms webhook, forwarding to Make");
+
+      // Forward to Make as application/x-www-form-urlencoded
+      fetch(MAKE_TELNYX_URL, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: params.toString()
+      }).catch((err) => {
+        log.error({ err }, "error forwarding sms to Make");
+      });
+
+      res.sendStatus(200);
+    } catch (e) {
+      log.error(e, "sms webhook error");
+      res.sendStatus(200);
+    }
   }
-});
+);
 
 // Stripe -> verify sig -> forward to Make
 app.post("/webhooks/stripe", async (req, res) => {
