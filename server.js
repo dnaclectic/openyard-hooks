@@ -16,9 +16,7 @@ const {
   TWILIO_FROM_NUMBER,
   BOOKING_PRICE_CENTS,
   STRIPE_SUCCESS_URL,
-  STRIPE_CANCEL_URL,
-  SHORTIO_API_KEY,
-  SHORTIO_DOMAIN
+  STRIPE_CANCEL_URL
 } = process.env;
 
 if (
@@ -58,42 +56,6 @@ async function sendSms(to, body) {
   }
 }
 
-// ----- Helper: Shorten URL via Short.io -----
-// If SHORTIO_API_KEY or SHORTIO_DOMAIN are missing, just return the original URL.
-async function shortenUrl(longUrl) {
-  if (!SHORTIO_API_KEY || !SHORTIO_DOMAIN) {
-    return longUrl;
-  }
-
-  try {
-    const resp = await fetch("https://api.short.io/links", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: SHORTIO_API_KEY
-      },
-      body: JSON.stringify({
-        domain: SHORTIO_DOMAIN,
-        originalURL: longUrl
-      })
-    });
-
-    if (!resp.ok) {
-      const txt = await resp.text();
-      console.error("Short.io error:", resp.status, txt);
-      return longUrl;
-    }
-
-    const data = await resp.json();
-    const shortUrl = data.secureShortURL || data.shortURL || longUrl;
-    console.log("Short.io created link:", shortUrl);
-    return shortUrl;
-  } catch (err) {
-    console.error("Short.io exception:", err);
-    return longUrl;
-  }
-}
-
 // ----- 1) Inbound SMS from Twilio: /webhooks/twilio -----
 app.post(
   "/webhooks/twilio",
@@ -118,7 +80,7 @@ app.post(
         return;
       }
 
-      // For now, simple trigger: text "BOOK" starts a booking
+      // Simple trigger: text "BOOK" starts a booking
       if (messageText.toUpperCase().startsWith("BOOK")) {
         const priceCents = parseInt(BOOKING_PRICE_CENTS || "2500", 10); // default $25
 
@@ -142,11 +104,10 @@ app.post(
             STRIPE_SUCCESS_URL ||
             "https://openyardpark.com/thanks?session_id={CHECKOUT_SESSION_ID}",
           cancel_url:
-            STRIPE_CANCEL_URL ||
-            "https://openyardpark.com/cancelled",
+            STRIPE_CANCEL_URL || "https://openyardpark.com/cancelled",
           metadata: {
             phone: fromNumber || ""
-            // TODO: add lot_id, plate, etc once we build conversation flow
+            // later: lot_id, plate, etc.
           }
         });
 
@@ -159,7 +120,6 @@ app.post(
             status: "pending_payment",
             checkout_session_id: session.id,
             amount_cents: priceCents
-            // lot_id: null for now
           }
         ]);
 
@@ -167,13 +127,10 @@ app.post(
           console.error("Supabase insert booking error:", error);
         }
 
-        // 3) Shorten URL (if Short.io configured)
-        const paymentUrl = await shortenUrl(session.url);
-
-        // 4) Reply to driver with payment URL
+        // 3) Reply to driver with payment URL (full Stripe URL for now)
         await sendSms(
           fromNumber,
-          `OpenYard: Tap to pay and reserve your spot: ${paymentUrl}`
+          `OpenYard: Tap to pay and reserve your spot: ${session.url}`
         );
       } else {
         // Simple help message for anything else
@@ -183,11 +140,7 @@ app.post(
         );
       }
 
-      console.log(
-        "Finished /webhooks/twilio in",
-        Date.now() - start,
-        "ms"
-      );
+      console.log("Finished /webhooks/twilio in", Date.now() - start, "ms");
 
       // Twilio expects some TwiML; empty response is fine
       res.type("text/xml").send("<Response></Response>");
