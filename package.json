@@ -1,14 +1,13 @@
 {
-  "name": "openyard-hooks",
-  "private": true,
-  "type": "module",
-  "scripts": { "start": "node server.js" },
+  "name": "openyard-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
     "express": "^4.19.2",
-    "node-fetch": "^3.3.2",
-    "stripe": "^16.0.0",
-    "pino": "^9.3.2",
-    "pino-http": "^9.0.0",
-    "raw-body": "^2.5.2"
+    "stripe": "^16.0.0"
   }
 }
