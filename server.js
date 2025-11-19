@@ -16,7 +16,9 @@ const {
   TWILIO_FROM_NUMBER,
   BOOKING_PRICE_CENTS,
   STRIPE_SUCCESS_URL,
-  STRIPE_CANCEL_URL
+  STRIPE_CANCEL_URL,
+  SHORTIO_API_KEY,
+  SHORTIO_DOMAIN
 } = process.env;
 
 if (
@@ -39,7 +41,7 @@ const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const app = express();
 
 // Stripe webhooks want JSON; Twilio sends urlencoded.
-// Use both middlewares, but urlencoded only on Twilio route.
+// Use JSON globally and urlencoded only on the Twilio route.
 app.use(express.json());
 
 // ----- Helper: send SMS via Twilio -----
@@ -56,19 +58,62 @@ async function sendSms(to, body) {
   }
 }
 
+// ----- Helper: Shorten URL via Short.io -----
+// If SHORTIO_API_KEY or SHORTIO_DOMAIN are missing, just return the original URL.
+async function shortenUrl(longUrl) {
+  if (!SHORTIO_API_KEY || !SHORTIO_DOMAIN) {
+    return longUrl;
+  }
+
+  try {
+    const resp = await fetch("https://api.short.io/links", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: SHORTIO_API_KEY
+      },
+      body: JSON.stringify({
+        domain: SHORTIO_DOMAIN,
+        originalURL: longUrl
+      })
+    });
+
+    if (!resp.ok) {
+      const txt = await resp.text();
+      console.error("Short.io error:", resp.status, txt);
+      return longUrl;
+    }
+
+    const data = await resp.json();
+    const shortUrl = data.secureShortURL || data.shortURL || longUrl;
+    console.log("Short.io created link:", shortUrl);
+    return shortUrl;
+  } catch (err) {
+    console.error("Short.io exception:", err);
+    return longUrl;
+  }
+}
+
 // ----- 1) Inbound SMS from Twilio: /webhooks/twilio -----
 app.post(
   "/webhooks/twilio",
   express.urlencoded({ extended: false }),
   async (req, res) => {
+    const start = Date.now();
     try {
       const fromNumber = req.body.From;
       const messageText = (req.body.Body || "").trim();
 
-      console.log("Inbound SMS from", fromNumber, "text:", messageText);
+      console.log(
+        "Twilio webhook hit at",
+        new Date().toISOString(),
+        "from",
+        fromNumber,
+        "text:",
+        messageText
+      );
 
       if (!fromNumber) {
-        // Ack and bail if something weird
         res.type("text/xml").send("<Response></Response>");
         return;
       }
@@ -101,7 +146,7 @@ app.post(
             "https://openyardpark.com/cancelled",
           metadata: {
             phone: fromNumber || ""
-            // later: add lot_id here
+            // TODO: add lot_id, plate, etc once we build conversation flow
           }
         });
 
@@ -122,10 +167,13 @@ app.post(
           console.error("Supabase insert booking error:", error);
         }
 
-        // 3) Reply to driver with payment URL
+        // 3) Shorten URL (if Short.io configured)
+        const paymentUrl = await shortenUrl(session.url);
+
+        // 4) Reply to driver with payment URL
         await sendSms(
           fromNumber,
-          `OpenYard: Tap to pay and reserve your spot: ${session.url}`
+          `OpenYard: Tap to pay and reserve your spot: ${paymentUrl}`
         );
       } else {
         // Simple help message for anything else
@@ -134,6 +182,12 @@ app.post(
           "OpenYard: To book overnight parking, reply with 'BOOK'."
         );
       }
+
+      console.log(
+        "Finished /webhooks/twilio in",
+        Date.now() - start,
+        "ms"
+      );
 
       // Twilio expects some TwiML; empty response is fine
       res.type("text/xml").send("<Response></Response>");
@@ -155,7 +209,11 @@ app.post("/webhooks/stripe", async (req, res) => {
       const checkoutId = session.id;
       const phone = session.metadata?.phone;
 
-      console.log("Stripe checkout.session.completed:", checkoutId, phone);
+      console.log(
+        "Stripe checkout.session.completed:",
+        checkoutId,
+        phone
+      );
 
       // 1) Update booking status in Supabase
       const { error } = await supabase
