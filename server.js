@@ -3,6 +3,7 @@
 const express = require("express");
 const Stripe = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
+const twilio = require("twilio");
 
 // ----- ENV SETUP -----
 const {
@@ -10,141 +11,139 @@ const {
   STRIPE_SECRET_KEY,
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
-  TELNYX_API_KEY,
-  TELNYX_FROM_NUMBER,      // e.g. "+18887881978"
-  BOOKING_PRICE_CENTS,     // e.g. "2500"
-  STRIPE_SUCCESS_URL,      // e.g. "https://openyardpark.com/thanks?session_id={CHECKOUT_SESSION_ID}"
-  STRIPE_CANCEL_URL        // e.g. "https://openyardpark.com/cancelled"
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  TWILIO_FROM_NUMBER,
+  BOOKING_PRICE_CENTS,
+  STRIPE_SUCCESS_URL,
+  STRIPE_CANCEL_URL
 } = process.env;
 
-if (!STRIPE_SECRET_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !TELNYX_API_KEY || !TELNYX_FROM_NUMBER) {
-  console.error("Missing one or more required env vars. Check STRIPE/TELNYX/SUPABASE configs.");
+if (
+  !STRIPE_SECRET_KEY ||
+  !SUPABASE_URL ||
+  !SUPABASE_SERVICE_ROLE_KEY ||
+  !TWILIO_ACCOUNT_SID ||
+  !TWILIO_AUTH_TOKEN ||
+  !TWILIO_FROM_NUMBER
+) {
+  console.error(
+    "Missing one or more required env vars. Check STRIPE/SUPABASE/TWILIO configs."
+  );
 }
 
 const stripe = Stripe(STRIPE_SECRET_KEY);
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 const app = express();
 
-// Stripe webhooks *technically* want raw body for signature verification.
-// For v1 MVP, we skip signature verification and just use JSON.
+// Stripe webhooks want JSON; Twilio sends urlencoded.
+// Use both middlewares, but urlencoded only on Twilio route.
 app.use(express.json());
 
-// ----- Helper: send SMS via Telnyx -----
-async function sendSms(to, text) {
+// ----- Helper: send SMS via Twilio -----
+async function sendSms(to, body) {
   try {
-    const resp = await fetch("https://api.telnyx.com/v2/messages", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${TELNYX_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        from: TELNYX_FROM_NUMBER,
-        to,
-        text
-      })
+    const msg = await twilioClient.messages.create({
+      from: TWILIO_FROM_NUMBER,
+      to,
+      body
     });
-
-    if (!resp.ok) {
-      const body = await resp.text();
-      console.error("Telnyx sendSms error:", resp.status, body);
-    }
+    console.log("Twilio SMS sent:", msg.sid);
   } catch (err) {
-    console.error("Telnyx sendSms exception:", err);
+    console.error("Twilio sendSms error:", err);
   }
 }
 
-// ----- 1) Inbound SMS: /webhooks/telnyx -----
-app.post("/webhooks/telnyx", async (req, res) => {
-  try {
-    const event = req.body;
+// ----- 1) Inbound SMS from Twilio: /webhooks/twilio -----
+app.post(
+  "/webhooks/twilio",
+  express.urlencoded({ extended: false }),
+  async (req, res) => {
+    try {
+      const fromNumber = req.body.From;
+      const messageText = (req.body.Body || "").trim();
 
-    // Telnyx inbound example: event.data.event_type === "message.received"
-    // Text is at event.data.payload.text
-    const eventType = event?.data?.event_type;
-    const payload = event?.data?.payload;
+      console.log("Inbound SMS from", fromNumber, "text:", messageText);
 
-    if (eventType !== "message.received" || !payload) {
-      // Just ack things we don't care about so Telnyx doesn't retry forever
-      return res.sendStatus(200);
-    }
-
-    const fromNumber = payload.from?.phone_number;
-    const messageText = (payload.text || "").trim();
-
-    console.log("Inbound SMS from", fromNumber, "text:", messageText);
-
-    // For now, simple trigger: text "BOOK" (case-insensitive) starts a booking
-    if (messageText.toUpperCase().startsWith("BOOK")) {
-      const priceCents = parseInt(BOOKING_PRICE_CENTS || "2500", 10); // default $25
-
-      // 1) Create Stripe Checkout Session
-      const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        payment_method_types: ["card"],
-        line_items: [
-          {
-            price_data: {
-              currency: "usd",
-              product_data: {
-                name: "Overnight Truck Parking"
-              },
-              unit_amount: priceCents
-            },
-            quantity: 1
-          }
-        ],
-        success_url:
-          STRIPE_SUCCESS_URL ||
-          "https://openyardpark.com/thanks?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url:
-          STRIPE_CANCEL_URL ||
-          "https://openyardpark.com/cancelled",
-        metadata: {
-          phone: fromNumber || "",
-          // You can add lot_id here later when you support multiple lots
-        }
-      });
-
-      console.log("Created Stripe session:", session.id);
-
-      // 2) Store booking in Supabase (pending)
-      const { error } = await supabase.from("bookings").insert([
-        {
-          phone: fromNumber,
-          status: "pending_payment",
-          checkout_session_id: session.id,
-          amount_cents: priceCents
-          // lot_id: null for now
-        }
-      ]);
-
-      if (error) {
-        console.error("Supabase insert booking error:", error);
+      if (!fromNumber) {
+        // Ack and bail if something weird
+        res.type("text/xml").send("<Response></Response>");
+        return;
       }
 
-      // 3) Reply to driver with payment URL
-      await sendSms(
-        fromNumber,
-        `OpenYard: Tap to pay and reserve your spot: ${session.url}`
-      );
-    } else {
-      // Optional: basic help response
-      await sendSms(
-        fromNumber,
-        "OpenYard: To book overnight parking, reply with 'BOOK'."
-      );
-    }
+      // For now, simple trigger: text "BOOK" starts a booking
+      if (messageText.toUpperCase().startsWith("BOOK")) {
+        const priceCents = parseInt(BOOKING_PRICE_CENTS || "2500", 10); // default $25
 
-    // Always ack to stop retries
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("Error in /webhooks/telnyx:", err);
-    // Still 200 to avoid retry storms; log and fix instead of punishing drivers
-    res.sendStatus(200);
+        // 1) Create Stripe Checkout Session
+        const session = await stripe.checkout.sessions.create({
+          mode: "payment",
+          payment_method_types: ["card"],
+          line_items: [
+            {
+              price_data: {
+                currency: "usd",
+                product_data: {
+                  name: "Overnight Truck Parking"
+                },
+                unit_amount: priceCents
+              },
+              quantity: 1
+            }
+          ],
+          success_url:
+            STRIPE_SUCCESS_URL ||
+            "https://openyardpark.com/thanks?session_id={CHECKOUT_SESSION_ID}",
+          cancel_url:
+            STRIPE_CANCEL_URL ||
+            "https://openyardpark.com/cancelled",
+          metadata: {
+            phone: fromNumber || ""
+            // later: add lot_id here
+          }
+        });
+
+        console.log("Created Stripe session:", session.id);
+
+        // 2) Store booking in Supabase (pending)
+        const { error } = await supabase.from("bookings").insert([
+          {
+            phone: fromNumber,
+            status: "pending_payment",
+            checkout_session_id: session.id,
+            amount_cents: priceCents
+            // lot_id: null for now
+          }
+        ]);
+
+        if (error) {
+          console.error("Supabase insert booking error:", error);
+        }
+
+        // 3) Reply to driver with payment URL
+        await sendSms(
+          fromNumber,
+          `OpenYard: Tap to pay and reserve your spot: ${session.url}`
+        );
+      } else {
+        // Simple help message for anything else
+        await sendSms(
+          fromNumber,
+          "OpenYard: To book overnight parking, reply with 'BOOK'."
+        );
+      }
+
+      // Twilio expects some TwiML; empty response is fine
+      res.type("text/xml").send("<Response></Response>");
+    } catch (err) {
+      console.error("Error in /webhooks/twilio:", err);
+      // Still respond with empty TwiML so Twilio doesn't keep retrying
+      res.type("text/xml").send("<Response></Response>");
+    }
   }
-});
+);
 
 // ----- 2) Stripe webhook: /webhooks/stripe -----
 app.post("/webhooks/stripe", async (req, res) => {
