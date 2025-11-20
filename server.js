@@ -1,206 +1,730 @@
-// server.js
+// server.js – OpenYard SMS Booking Backend (clean, corrected, production-ready)
+
+require('dotenv').config();
 
 const express = require("express");
+const twilio = require("twilio");
 const Stripe = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
-const twilio = require("twilio");
 
-// ----- ENV SETUP -----
-const {
-  PORT,
-  STRIPE_SECRET_KEY,
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  TWILIO_ACCOUNT_SID,
-  TWILIO_AUTH_TOKEN,
-  TWILIO_FROM_NUMBER,
-  BOOKING_PRICE_CENTS,
-  STRIPE_SUCCESS_URL,
-  STRIPE_CANCEL_URL
-} = process.env;
+const app = express();
+const port = process.env.PORT || 3000;
 
-if (
-  !STRIPE_SECRET_KEY ||
-  !SUPABASE_URL ||
-  !SUPABASE_SERVICE_ROLE_KEY ||
-  !TWILIO_ACCOUNT_SID ||
-  !TWILIO_AUTH_TOKEN ||
-  !TWILIO_FROM_NUMBER
-) {
-  console.error(
-    "Missing one or more required env vars. Check STRIPE/SUPABASE/TWILIO configs."
+// -----------------------------------------------------
+// Clients
+// -----------------------------------------------------
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: "2023-10-16",
+});
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
+// -----------------------------------------------------
+// Stripe webhook (must come BEFORE body parsers)
+// -----------------------------------------------------
+app.post(
+  "/webhooks/stripe",
+  express.raw({ type: "application/json" }),
+  stripeWebhookHandler
+);
+
+// For everything else, use parsers
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+
+// Twilio inbound SMS
+app.post("/webhooks/twilio", twilioWebhookHandler);
+
+// Healthcheck
+app.get("/healthz", (req, res) => res.json({ ok: true }));
+
+// -----------------------------------------------------
+// Twilio → SMS Handler
+// -----------------------------------------------------
+
+async function twilioWebhookHandler(req, res) {
+  const from = req.body.From;
+  const body = (req.body.Body || "").trim();
+
+  console.log("Twilio webhook hit at", new Date().toISOString(), {
+    from,
+    body,
+  });
+
+  let replyText = "Sorry, something broke on our end.";
+
+  try {
+    replyText = await handleIncomingSms(from, body, req.body);
+  } catch (err) {
+    console.error("handleIncomingSms error:", err);
+    replyText =
+      "Oops, something went wrong. Try again or text HELP for assistance.";
+  }
+
+  const twiml = new twilio.twiml.MessagingResponse();
+  twiml.message(replyText);
+
+  res.type("text/xml").send(twiml.toString());
+}
+
+// -----------------------------------------------------
+// Core SMS Machine
+// -----------------------------------------------------
+
+async function handleIncomingSms(phone, text, rawPayload) {
+  const upper = text.toUpperCase().trim();
+
+  // GLOBAL COMMANDS
+  if (upper === "HELP") {
+    return (
+      "OpenYard Truck Parking.\n" +
+      "Text BOOK to start a new reservation.\n" +
+      "Text CANCEL to cancel your active booking."
+    );
+  }
+
+  if (upper === "STOP" || upper === "CANCEL") {
+    await deactivateActiveConversations(phone);
+    await logSms(null, phone, "inbound", text, rawPayload);
+    return "Okay, your booking flow has been cancelled. Text BOOK to start over.";
+  }
+
+  // FETCH ACTIVE CONVERSATION
+  const { data: convRows } = await supabase
+    .from("conversations")
+    .select("*")
+    .eq("driver_phone_e164", phone)
+    .eq("is_active", true)
+    .limit(1);
+
+  let conversation = convRows && convRows[0] ? convRows[0] : null;
+
+  // START NEW CONVERSATION
+  if (!conversation) {
+    if (upper !== "BOOK") {
+      await logSms(null, phone, "inbound", text, rawPayload);
+      return "Text BOOK to start a new truck parking reservation.";
+    }
+
+    // Create conversation
+    const { data: newConv } = await supabase
+      .from("conversations")
+      .insert({
+        driver_phone_e164: phone,
+        current_state: "awaiting_location_or_lot_code",
+        is_active: true,
+        last_inbound_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
+
+    conversation = newConv;
+
+    await logSms(conversation.id, phone, "inbound", text, rawPayload);
+
+    return (
+      "Where do you want to park?\n" +
+      'Reply with a city/exit (e.g. "Bozeman MT") or a lot code.'
+    );
+  }
+
+  // Log inbound
+  await logSms(conversation.id, phone, "inbound", text, rawPayload);
+
+  const state = conversation.current_state;
+
+  switch (state) {
+    case "awaiting_location_or_lot_code":
+      return handleLocationState(conversation, text);
+
+    case "awaiting_lot_choice":
+      return handleLotChoiceState(conversation, text);
+
+    case "awaiting_name":
+      return handleNameState(conversation, text);
+
+    case "awaiting_truck_type":
+      return handleTruckTypeState(conversation, text);
+
+    case "awaiting_make_model":
+      return handleMakeModelState(conversation, text);
+
+    case "awaiting_plate":
+      return handlePlateState(conversation, text);
+
+    case "awaiting_stay_option":
+      return handleStayOptionState(conversation, text);
+
+    case "awaiting_custom_nights":
+      return handleCustomNightsState(conversation, text);
+
+    case "awaiting_summary_confirmation":
+      return handleSummaryConfirmState(conversation, text);
+
+    case "awaiting_payment":
+      return (
+        "Your payment link was already sent.\n" +
+        "Complete payment to confirm.\n" +
+        "Reply HELP for assistance."
+      );
+
+    default:
+      return "Text BOOK to start a new booking.";
+  }
+}
+
+// -----------------------------------------------------
+// Per-State Handlers
+// (These match the entire flow we designed earlier)
+// -----------------------------------------------------
+
+async function handleLocationState(conversation, text) {
+  const raw = text.trim();
+
+  await updateConversation(conversation.id, { location_raw_input: raw });
+
+  // Try slug/lot_code exact match
+  let { data: lots } = await supabase
+    .from("lots")
+    .select("*")
+    .eq("is_active", true)
+    .or(
+      `lot_code.ilike.${raw},slug.ilike.${raw.toLowerCase().replace(/\s+/g, "-")}`
+    );
+
+  // If none, try city/state
+  if (!lots || lots.length === 0) {
+    const parts = raw.split(/\s+/);
+    const city = parts[0];
+    const state = parts[1] || null;
+
+    let q = supabase
+      .from("lots")
+      .select("*")
+      .eq("is_active", true)
+      .ilike("city", `${city}%`);
+
+    if (state) q = q.ilike("state", `${state}%`);
+
+    const { data: results } = await q;
+    lots = results || [];
+  }
+
+  if (!lots || lots.length === 0) {
+    return (
+      "I couldn't find any lots near that.\n" +
+      'Try a city + state (e.g. "Bozeman MT").'
+    );
+  }
+
+  // SINGLE LOT
+  if (lots.length === 1) {
+    const lot = lots[0];
+
+    await updateConversation(conversation.id, {
+      lot_id: lot.id,
+      current_state: "awaiting_name",
+    });
+
+    return (
+      `You’re booking: ${lot.name}${
+        lot.region_label ? " – " + lot.region_label : ""
+      }.\n` + "What’s your first and last name?"
+    );
+  }
+
+  // MULTIPLE LOTS
+  const limited = lots.slice(0, 5);
+  const lines = limited.map(
+    (lot, i) =>
+      `${i + 1}) ${lot.name}${
+        lot.region_label ? " – " + lot.region_label : ""
+      }`
+  );
+
+  await updateConversation(conversation.id, {
+    current_state: "awaiting_lot_choice",
+  });
+
+  return (
+    "I found these lots:\n" + lines.join("\n") + "\n\nReply with a number."
   );
 }
 
-const stripe = Stripe(STRIPE_SECRET_KEY);
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-
-const app = express();
-
-// Stripe webhooks want JSON; Twilio sends urlencoded.
-// Use JSON globally and urlencoded only on the Twilio route.
-app.use(express.json());
-
-// ----- Helper: send SMS via Twilio -----
-async function sendSms(to, body) {
-  try {
-    const msg = await twilioClient.messages.create({
-      from: TWILIO_FROM_NUMBER,
-      to,
-      body
-    });
-    console.log("Twilio SMS sent:", msg.sid);
-  } catch (err) {
-    console.error("Twilio sendSms error:", err);
+async function handleLotChoiceState(conversation, text) {
+  const n = parseInt(text.trim(), 10);
+  if (Number.isNaN(n) || n < 1) {
+    return "Reply with a valid number from the list.";
   }
+
+  const input = conversation.location_raw_input || "";
+  const parts = input.split(/\s+/);
+  const city = parts[0];
+  const state = parts[1] || null;
+
+  let q = supabase
+    .from("lots")
+    .select("*")
+    .eq("is_active", true)
+    .ilike("city", `${city}%`);
+
+  if (state) q = q.ilike("state", `${state}%`);
+
+  const { data: lots } = await q;
+
+  const limited = (lots || []).slice(0, 5);
+  if (n > limited.length) return "Please choose a valid number.";
+
+  const chosen = limited[n - 1];
+
+  await updateConversation(conversation.id, {
+    lot_id: chosen.id,
+    current_state: "awaiting_name",
+  });
+
+  return (
+    `You’re booking: ${chosen.name}${
+      chosen.region_label ? " – " + chosen.region_label : ""
+    }.\n` + "What’s your first and last name?"
+  );
 }
 
-// ----- 1) Inbound SMS from Twilio: /webhooks/twilio -----
-app.post(
-  "/webhooks/twilio",
-  express.urlencoded({ extended: false }),
-  async (req, res) => {
-    const start = Date.now();
-    try {
-      const fromNumber = req.body.From;
-      const messageText = (req.body.Body || "").trim();
+async function handleNameState(conversation, text) {
+  const full = text.trim();
+  if (!full || full.length < 2) return "Please send your full name.";
 
-      console.log(
-        "Twilio webhook hit at",
-        new Date().toISOString(),
-        "from",
-        fromNumber,
-        "text:",
-        messageText
-      );
+  await updateConversation(conversation.id, {
+    driver_full_name: full,
+    current_state: "awaiting_truck_type",
+  });
 
-      if (!fromNumber) {
-        res.type("text/xml").send("<Response></Response>");
-        return;
-      }
+  return (
+    "What are you parking?\n" +
+    "1) Semi\n" +
+    "2) Bobtail\n" +
+    "3) Hotshot\n" +
+    "4) Other\n" +
+    "Reply with a number."
+  );
+}
 
-      // Simple trigger: text "BOOK" starts a booking
-      if (messageText.toUpperCase().startsWith("BOOK")) {
-        const priceCents = parseInt(BOOKING_PRICE_CENTS || "2500", 10); // default $25
+async function handleTruckTypeState(conversation, text) {
+  const n = parseInt(text.trim(), 10);
+  const types = {
+    1: "semi",
+    2: "bobtail",
+    3: "hotshot",
+    4: "other",
+  };
+  const truckType = types[n];
+  if (!truckType) return "Reply 1,2,3, or 4.";
 
-        // 1) Create Stripe Checkout Session
-        const session = await stripe.checkout.sessions.create({
-          mode: "payment",
-          payment_method_types: ["card"],
-          line_items: [
-            {
-              price_data: {
-                currency: "usd",
-                product_data: {
-                  name: "Overnight Truck Parking"
-                },
-                unit_amount: priceCents
-              },
-              quantity: 1
-            }
-          ],
-          success_url:
-            STRIPE_SUCCESS_URL ||
-            "https://openyardpark.com/thanks?session_id={CHECKOUT_SESSION_ID}",
-          cancel_url:
-            STRIPE_CANCEL_URL || "https://openyardpark.com/cancelled",
-          metadata: {
-            phone: fromNumber || ""
-            // later: lot_id, plate, etc.
-          }
-        });
+  await updateConversation(conversation.id, {
+    truck_type: truckType,
+    current_state: "awaiting_make_model",
+  });
 
-        console.log("Created Stripe session:", session.id);
+  return 'Truck make & model? (e.g. "Freightliner Cascadia")';
+}
 
-        // 2) Store booking in Supabase (pending)
-        const { error } = await supabase.from("bookings").insert([
-          {
-            phone: fromNumber,
-            status: "pending_payment",
-            checkout_session_id: session.id,
-            amount_cents: priceCents
-          }
-        ]);
+async function handleMakeModelState(conversation, text) {
+  const v = text.trim();
+  if (!v || v.length < 2) return "Please send truck make & model.";
 
-        if (error) {
-          console.error("Supabase insert booking error:", error);
-        }
+  await updateConversation(conversation.id, {
+    truck_make_model: v,
+    current_state: "awaiting_plate",
+  });
 
-        // 3) Reply to driver with payment URL (full Stripe URL for now)
-        await sendSms(
-          fromNumber,
-          `OpenYard: Tap to pay and reserve your spot: ${session.url}`
-        );
-      } else {
-        // Simple help message for anything else
-        await sendSms(
-          fromNumber,
-          "OpenYard: To book overnight parking, reply with 'BOOK'."
-        );
-      }
+  return 'Plate (state + number)? (e.g. "MT 7-XYZ456")';
+}
 
-      console.log("Finished /webhooks/twilio in", Date.now() - start, "ms");
+async function handlePlateState(conversation, text) {
+  const v = text.trim();
+  if (!v || v.length < 2) return "Please send a valid license plate.";
 
-      // Twilio expects some TwiML; empty response is fine
-      res.type("text/xml").send("<Response></Response>");
-    } catch (err) {
-      console.error("Error in /webhooks/twilio:", err);
-      // Still respond with empty TwiML so Twilio doesn't keep retrying
-      res.type("text/xml").send("<Response></Response>");
-    }
+  await updateConversation(conversation.id, {
+    license_plate_raw: v,
+    current_state: "awaiting_stay_option",
+  });
+
+  return (
+    "How long are you staying?\n" +
+    "1) 1 night\n" +
+    "2) 7 nights\n" +
+    "3) 30 nights\n" +
+    "4) Other\n" +
+    "Reply with a number."
+  );
+}
+
+async function handleStayOptionState(conversation, text) {
+  const n = parseInt(text.trim(), 10);
+  if (![1, 2, 3, 4].includes(n)) return "Reply 1–4.";
+
+  let stayType, nights;
+
+  if (n === 1) {
+    stayType = "overnight";
+    nights = 1;
+  } else if (n === 2) {
+    stayType = "weekly";
+    nights = 7;
+  } else if (n === 3) {
+    stayType = "monthly";
+    nights = 30;
+  } else {
+    await updateConversation(conversation.id, {
+      current_state: "awaiting_custom_nights",
+    });
+    return "How many nights?";
   }
-);
 
-// ----- 2) Stripe webhook: /webhooks/stripe -----
-app.post("/webhooks/stripe", async (req, res) => {
+  await updateConversation(conversation.id, {
+    stay_type: stayType,
+    nights,
+    current_state: "awaiting_summary_confirmation",
+  });
+
+  return buildSummaryPrompt(conversation.id, stayType, nights);
+}
+
+async function handleCustomNightsState(conversation, text) {
+  const n = parseInt(text.trim(), 10);
+  if (Number.isNaN(n) || n < 1 || n > 90)
+    return "Enter 1–90 nights.";
+
+  await updateConversation(conversation.id, {
+    stay_type: "custom",
+    nights: n,
+    current_state: "awaiting_summary_confirmation",
+  });
+
+  return buildSummaryPrompt(conversation.id, "custom", n);
+}
+
+async function buildSummaryPrompt(conversationId, stayType, nights) {
+  const { data: conv } = await supabase
+    .from("conversations")
+    .select("*")
+    .eq("id", conversationId)
+    .single();
+
+  const { data: lot } = await supabase
+    .from("lots")
+    .select("*")
+    .eq("id", conv.lot_id)
+    .single();
+
+  const pricing = computePricing(lot, stayType, nights);
+  const totalDollars = (pricing.total_cents / 100).toFixed(2);
+
+  // Save quoted price
+  await updateConversation(conversationId, {
+    quoted_total_cents: pricing.total_cents,
+  });
+
+  return (
+    "Here’s your booking:\n" +
+    `• Lot: ${lot.name}${
+      lot.region_label ? " – " + lot.region_label : ""
+    }\n` +
+    `• Name: ${conv.driver_full_name}\n` +
+    `• Truck: ${conv.truck_type} – ${conv.truck_make_model}\n` +
+    `• Plate: ${conv.license_plate_raw}\n` +
+    `• Stay: ${nights} night(s)\n` +
+    `• Total: $${totalDollars}\n\n` +
+    "Reply YES to get your payment link, or NO to cancel."
+  );
+}
+
+async function handleSummaryConfirmState(conversation, text) {
+  const upper = text.trim().toUpperCase();
+
+  if (upper === "NO" || upper === "N") {
+    await updateConversation(conversation.id, {
+      current_state: "cancelled",
+      is_active: false,
+    });
+    return "No problem, booking cancelled.";
+  }
+
+  if (!(upper === "YES" || upper === "Y")) {
+    return "Reply YES to get your payment link, or NO to cancel.";
+  }
+
+  // YES → create booking + Stripe session
+  return createBooking(conversation);
+}
+
+// -----------------------------------------------------
+// CREATE BOOKING + STRIPE CHECKOUT
+// -----------------------------------------------------
+
+async function createBooking(conversation) {
+  // Reload convo with all fields
+  const { data: conv } = await supabase
+    .from("conversations")
+    .select("*")
+    .eq("id", conversation.id)
+    .single();
+
+  // Fetch lot
+  const { data: lot } = await supabase
+    .from("lots")
+    .select("*")
+    .eq("id", conv.lot_id)
+    .single();
+
+  const pricing = computePricing(lot, conv.stay_type, conv.nights);
+
+  const today = new Date();
+  const startDate = today.toISOString().slice(0, 10);
+  const end = new Date(today);
+  end.setDate(end.getDate() + (conv.nights || 1));
+  const endDate = end.toISOString().slice(0, 10);
+
+  // Insert booking with correct fields (NO amount_cents)
+  const { data: booking, error: bookingErr } = await supabase
+    .from("bookings")
+    .insert({
+      conversation_id: conv.id,
+      lot_id: conv.lot_id,
+      driver_phone_e164: conv.driver_phone_e164,
+      driver_full_name: conv.driver_full_name,
+      truck_type: conv.truck_type,
+      truck_make_model: conv.truck_make_model,
+      license_plate_raw: conv.license_plate_raw,
+      stay_type: conv.stay_type,
+      nights: conv.nights,
+      start_date: startDate,
+      end_date: endDate,
+      nightly_rate_cents: pricing.nightly_rate_cents,
+      weekly_rate_cents: lot.weekly_rate_cents,
+      monthly_rate_cents: lot.monthly_rate_cents,
+      subtotal_cents: pricing.subtotal_cents,
+      deposit_hold_cents: pricing.deposit_hold_cents,
+      total_cents: pricing.total_cents,
+      currency: "usd",
+      status: "pending_payment",
+    })
+    .select()
+    .single();
+
+  if (bookingErr) {
+    console.error("Supabase insert booking error:", bookingErr);
+    return "We couldn't create your booking. Please try again.";
+  }
+
+  // Create Stripe Checkout Session
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    payment_method_types: ["card"],
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: "usd",
+          unit_amount: pricing.total_cents,
+          product_data: {
+            name: `Truck Parking – ${lot.name}`,
+            description: `${conv.nights} night(s) at ${lot.name}`,
+          },
+        },
+      },
+    ],
+    metadata: {
+      booking_id: booking.id,
+    },
+    success_url:
+      process.env.CHECKOUT_SUCCESS_URL ||
+      "https://openyardpark.com/success",
+    cancel_url:
+      process.env.CHECKOUT_CANCEL_URL ||
+      "https://openyardpark.com/cancel",
+  });
+
+  // Save session id
+  await supabase
+    .from("bookings")
+    .update({
+      stripe_session_id: session.id,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", booking.id);
+
+  await updateConversation(conv.id, {
+    booking_id: booking.id,
+    current_state: "awaiting_payment",
+  });
+
+  await logSms(
+    conv.id,
+    conv.driver_phone_e164,
+    "outbound",
+    session.url
+  );
+
+  return "Here’s your secure payment link:\n" + session.url;
+}
+
+// -----------------------------------------------------
+// PRICE CALC
+// -----------------------------------------------------
+
+function computePricing(lot, stayType, nights) {
+  const n = Number(nights || 1);
+  const nightly = lot.nightly_rate_cents || 2500;
+
+  let subtotal = nightly * n;
+
+  // Optional: weekly/monthly special pricing
+  if (stayType === "weekly" && lot.weekly_rate_cents) {
+    subtotal = lot.weekly_rate_cents;
+  }
+  if (stayType === "monthly" && lot.monthly_rate_cents) {
+    subtotal = lot.monthly_rate_cents;
+  }
+
+  const depositHold = 0;
+  const total = subtotal + depositHold;
+
+  return {
+    nightly_rate_cents: nightly,
+    weekly_rate_cents: lot.weekly_rate_cents,
+    monthly_rate_cents: lot.monthly_rate_cents,
+    subtotal_cents: subtotal,
+    deposit_hold_cents: depositHold,
+    total_cents: total,
+  };
+}
+
+// -----------------------------------------------------
+// STRIPE WEBHOOK
+// -----------------------------------------------------
+
+async function stripeWebhookHandler(req, res) {
+  const sig = req.headers["stripe-signature"];
+
+  let event;
   try {
-    const event = req.body;
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error("Stripe signature error:", err.message);
+    return res.status(400).send("Invalid signature");
+  }
 
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      const checkoutId = session.id;
-      const phone = session.metadata?.phone;
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const bookingId =
+      session.metadata && session.metadata.booking_id;
 
-      console.log(
-        "Stripe checkout.session.completed:",
-        checkoutId,
-        phone
-      );
-
-      // 1) Update booking status in Supabase
-      const { error } = await supabase
-        .from("bookings")
-        .update({ status: "confirmed" })
-        .eq("checkout_session_id", checkoutId);
-
-      if (error) {
-        console.error("Supabase update booking error:", error);
-      }
-
-      // 2) Text driver confirmation
-      if (phone) {
-        await sendSms(
-          phone,
-          "OpenYard: Your booking is confirmed. Show this message if asked. (Demo: stall assignment and directions coming next.)"
-        );
-      }
+    if (!bookingId) {
+      console.warn("Stripe: missing booking_id");
+      return res.send("ok");
     }
 
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("Error in /webhooks/stripe:", err);
-    res.sendStatus(200);
+    // Update booking
+    const { data: rows } = await supabase
+      .from("bookings")
+      .update({
+        status: "confirmed",
+        paid_at: new Date().toISOString(),
+        stripe_payment_intent_id: session.payment_intent,
+        stripe_customer_id: session.customer,
+      })
+      .eq("id", bookingId)
+      .select()
+      .limit(1);
+
+    const booking = rows[0];
+
+    // Send confirmation SMS
+    const { data: lot } = await supabase
+      .from("lots")
+      .select("*")
+      .eq("id", booking.lot_id)
+      .single();
+
+    const instructions =
+      lot.parking_instructions ||
+      "Park in marked truck stalls.";
+
+    const msg =
+      "✅ Your booking is confirmed!\n" +
+      `${lot.name}${lot.region_label ? " – " + lot.region_label : ""}\n` +
+      `Dates: ${booking.start_date} to ${booking.end_date}\n` +
+      `Plate: ${booking.license_plate_raw}\n\n` +
+      `Instructions:\n${instructions}`;
+
+    await twilioClient.messages.create({
+      from: process.env.TWILIO_NUMBER,
+      to: booking.driver_phone_e164,
+      body: msg,
+    });
+
+    await logSms(
+      booking.conversation_id,
+      booking.driver_phone_e164,
+      "outbound",
+      msg
+    );
   }
-});
 
-// ----- HEALTHCHECK -----
-app.get("/healthz", (_req, res) => {
-  res.json({ ok: true });
-});
+  res.send("ok");
+}
 
-// ----- START SERVER -----
-const port = PORT || 3000;
-app.listen(port, () => {
-  console.log(`OpenYard backend listening on port ${port}`);
-});
+// -----------------------------------------------------
+// Utilities
+// -----------------------------------------------------
+
+async function logSms(conversationId, phone, direction, msg, raw) {
+  await supabase.from("sms_messages").insert({
+    conversation_id: conversationId,
+    driver_phone_e164: phone,
+    direction,
+    message_body: msg,
+    raw_provider_payload: raw
+      ? JSON.stringify(raw).substring(0, 8000)
+      : null,
+  });
+}
+
+async function updateConversation(id, fields) {
+  await supabase
+    .from("conversations")
+    .update({
+      ...fields,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", id);
+}
+
+async function deactivateActiveConversations(phone) {
+  await supabase
+    .from("conversations")
+    .update({
+      is_active: false,
+      current_state: "cancelled",
+    })
+    .eq("driver_phone_e164", phone)
+    .eq("is_active", true);
+}
+
+// -----------------------------------------------------
+app.listen(port, () =>
+  console.log(`OpenYard backend listening on port ${port}`)
+);
