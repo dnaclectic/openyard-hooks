@@ -1,11 +1,11 @@
-// server.js – OpenYard SMS Booking Backend with scheduled review nudges
+// server.js – OpenYard SMS Booking Backend (ESM) with next-day 8pm review nudges
 
-require("dotenv").config();
-
-const express = require("express");
-const twilio = require("twilio");
-const Stripe = require("stripe");
-const { createClient } = require("@supabase/supabase-js");
+import 'dotenv/config';
+import express from 'express';
+import twilio from 'twilio';
+import Stripe from 'stripe';
+import { createClient } from '@supabase/supabase-js';
+import { DateTime } from 'luxon';
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -15,7 +15,7 @@ const port = process.env.PORT || 3000;
 // -----------------------------------------------------
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: "2023-10-16",
+  apiVersion: '2023-10-16',
 });
 
 const supabase = createClient(
@@ -32,8 +32,8 @@ const twilioClient = twilio(
 // Stripe webhook (must come BEFORE body parsers)
 // -----------------------------------------------------
 app.post(
-  "/webhooks/stripe",
-  express.raw({ type: "application/json" }),
+  '/webhooks/stripe',
+  express.raw({ type: 'application/json' }),
   stripeWebhookHandler
 );
 
@@ -42,16 +42,15 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // Twilio inbound SMS
-app.post("/webhooks/twilio", twilioWebhookHandler);
+app.post('/webhooks/twilio', twilioWebhookHandler);
 
-// Healthcheck + background jobs
-app.get("/healthz", async (req, res) => {
+// Healthcheck (also runs due scheduled messages)
+app.get('/healthz', async (req, res) => {
   try {
-    // Run any due scheduled messages on each healthcheck call
     await runDueReviewMessages();
     return res.json({ ok: true });
   } catch (err) {
-    console.error("healthz error:", err);
+    console.error('healthz error:', err);
     return res.status(500).json({ ok: false });
   }
 });
@@ -62,27 +61,27 @@ app.get("/healthz", async (req, res) => {
 
 async function twilioWebhookHandler(req, res) {
   const from = req.body.From;
-  const body = (req.body.Body || "").trim();
+  const body = (req.body.Body || '').trim();
 
-  console.log("Twilio webhook hit at", new Date().toISOString(), {
+  console.log('Twilio webhook hit at', new Date().toISOString(), {
     from,
     body,
   });
 
-  let replyText = "Sorry, something broke on our end.";
+  let replyText = 'Sorry, something broke on our end.';
 
   try {
     replyText = await handleIncomingSms(from, body, req.body);
   } catch (err) {
-    console.error("handleIncomingSms error:", err);
+    console.error('handleIncomingSms error:', err);
     replyText =
-      "Oops, something went wrong. Try again or text HELP for assistance.";
+      'Oops, something went wrong. Try again or text HELP for assistance.';
   }
 
   const twiml = new twilio.twiml.MessagingResponse();
   twiml.message(replyText);
 
-  res.type("text/xml").send(twiml.toString());
+  res.type('text/xml').send(twiml.toString());
 }
 
 // -----------------------------------------------------
@@ -93,47 +92,46 @@ async function handleIncomingSms(phone, text, rawPayload) {
   const upper = text.toUpperCase().trim();
 
   // GLOBAL COMMANDS
-  if (upper === "HELP") {
+  if (upper === 'HELP') {
     return (
-      "OpenYard Truck Parking.\n" +
-      "Text BOOK to start a new reservation.\n" +
-      "Text CANCEL to cancel your active booking."
+      'OpenYard Truck Parking.\n' +
+      'Text BOOK to start a new reservation.\n' +
+      'Text CANCEL to cancel your active booking.'
     );
   }
 
-  if (upper === "STOP" || upper === "CANCEL") {
+  if (upper === 'STOP' || upper === 'CANCEL') {
     await deactivateActiveConversations(phone);
-    await logSms(null, phone, "inbound", text, rawPayload);
-    return "Okay, your booking flow has been cancelled. Text BOOK to start over.";
+    await logSms(null, phone, 'inbound', text, rawPayload);
+    return 'Okay, your booking flow has been cancelled. Text BOOK to start over.';
   }
 
   // FETCH ACTIVE CONVERSATION
   const { data: convRows, error: convErr } = await supabase
-    .from("conversations")
-    .select("*")
-    .eq("driver_phone_e164", phone)
-    .eq("is_active", true)
+    .from('conversations')
+    .select('*')
+    .eq('driver_phone_e164', phone)
+    .eq('is_active', true)
     .limit(1);
 
   if (convErr) {
-    console.error("Error fetching conversation:", convErr);
+    console.error('Error fetching conversation:', convErr);
   }
 
   let conversation = convRows && convRows[0] ? convRows[0] : null;
 
   // START NEW CONVERSATION
   if (!conversation) {
-    if (upper !== "BOOK") {
-      await logSms(null, phone, "inbound", text, rawPayload);
-      return "Text BOOK to start a new truck parking reservation.";
+    if (upper !== 'BOOK') {
+      await logSms(null, phone, 'inbound', text, rawPayload);
+      return 'Text BOOK to start a new truck parking reservation.';
     }
 
-    // Create conversation
     const { data: newConv, error: newConvErr } = await supabase
-      .from("conversations")
+      .from('conversations')
       .insert({
         driver_phone_e164: phone,
-        current_state: "awaiting_location_or_lot_code",
+        current_state: 'awaiting_location_or_lot_code',
         is_active: true,
         last_inbound_at: new Date().toISOString(),
       })
@@ -141,62 +139,62 @@ async function handleIncomingSms(phone, text, rawPayload) {
       .single();
 
     if (newConvErr) {
-      console.error("Error creating conversation:", newConvErr);
-      return "We couldn't start a booking right now. Try again in a minute.";
+      console.error('Error creating conversation:', newConvErr);
+      return 'We couldn\'t start a booking right now. Try again in a minute.';
     }
 
     conversation = newConv;
 
-    await logSms(conversation.id, phone, "inbound", text, rawPayload);
+    await logSms(conversation.id, phone, 'inbound', text, rawPayload);
 
     return (
-      "Where do you want to park?\n" +
+      'Where do you want to park?\n' +
       'Reply with a city/exit (e.g. "Bozeman MT") or a lot code.'
     );
   }
 
   // Log inbound
-  await logSms(conversation.id, phone, "inbound", text, rawPayload);
+  await logSms(conversation.id, phone, 'inbound', text, rawPayload);
 
   const state = conversation.current_state;
 
   switch (state) {
-    case "awaiting_location_or_lot_code":
+    case 'awaiting_location_or_lot_code':
       return handleLocationState(conversation, text);
 
-    case "awaiting_lot_choice":
+    case 'awaiting_lot_choice':
       return handleLotChoiceState(conversation, text);
 
-    case "awaiting_name":
+    case 'awaiting_name':
       return handleNameState(conversation, text);
 
-    case "awaiting_truck_type":
+    case 'awaiting_truck_type':
       return handleTruckTypeState(conversation, text);
 
-    case "awaiting_make_model":
+    case 'awaiting_make_model':
       return handleMakeModelState(conversation, text);
 
-    case "awaiting_plate":
+    case 'awaiting_plate':
       return handlePlateState(conversation, text);
 
-    case "awaiting_stay_option":
+    case 'awaiting_stay_option':
       return handleStayOptionState(conversation, text);
 
-    case "awaiting_custom_nights":
+    case 'awaiting_custom_nights':
       return handleCustomNightsState(conversation, text);
 
-    case "awaiting_summary_confirmation":
+    case 'awaiting_summary_confirmation':
       return handleSummaryConfirmState(conversation, text);
 
-    case "awaiting_payment":
+    case 'awaiting_payment':
       return (
-        "Your payment link was already sent.\n" +
-        "Complete payment to confirm.\n" +
-        "Reply HELP for assistance."
+        'Your payment link was already sent.\n' +
+        'Complete payment to confirm.\n' +
+        'Reply HELP for assistance.'
       );
 
     default:
-      return "Text BOOK to start a new booking.";
+      return 'Text BOOK to start a new booking.';
   }
 }
 
@@ -211,15 +209,15 @@ async function handleLocationState(conversation, text) {
 
   // Try slug/lot_code exact match
   let { data: lots, error: lotsErr } = await supabase
-    .from("lots")
-    .select("*")
-    .eq("is_active", true)
+    .from('lots')
+    .select('*')
+    .eq('is_active', true)
     .or(
-      `lot_code.ilike.${raw},slug.ilike.${raw.toLowerCase().replace(/\s+/g, "-")}`
+      `lot_code.ilike.${raw},slug.ilike.${raw.toLowerCase().replace(/\s+/g, '-')}`
     );
 
   if (lotsErr) {
-    console.error("Error fetching lots (slug/code):", lotsErr);
+    console.error('Error fetching lots (slug/code):', lotsErr);
   }
 
   // If none, try city/state
@@ -229,16 +227,16 @@ async function handleLocationState(conversation, text) {
     const state = parts[1] || null;
 
     let q = supabase
-      .from("lots")
-      .select("*")
-      .eq("is_active", true)
-      .ilike("city", `${city}%`);
+      .from('lots')
+      .select('*')
+      .eq('is_active', true)
+      .ilike('city', `${city}%`);
 
-    if (state) q = q.ilike("state", `${state}%`);
+    if (state) q = q.ilike('state', `${state}%`);
 
     const { data: results, error: cityErr } = await q;
     if (cityErr) {
-      console.error("Error fetching lots (city/state):", cityErr);
+      console.error('Error fetching lots (city/state):', cityErr);
     }
     lots = results || [];
   }
@@ -256,13 +254,13 @@ async function handleLocationState(conversation, text) {
 
     await updateConversation(conversation.id, {
       lot_id: lot.id,
-      current_state: "awaiting_name",
+      current_state: 'awaiting_name',
     });
 
     return (
       `You’re booking: ${lot.name}${
-        lot.region_label ? " – " + lot.region_label : ""
-      }.\n` + "What’s your first and last name?"
+        lot.region_label ? ' – ' + lot.region_label : ''
+      }.\n` + 'What’s your first and last name?'
     );
   }
 
@@ -270,92 +268,90 @@ async function handleLocationState(conversation, text) {
   const limited = lots.slice(0, 5);
   const lines = limited.map(
     (lot, i) =>
-      `${i + 1}) ${lot.name}${
-        lot.region_label ? " – " + lot.region_label : ""
-      }`
+      `${i + 1}) ${lot.name}${lot.region_label ? ' – ' + lot.region_label : ''}`
   );
 
   await updateConversation(conversation.id, {
-    current_state: "awaiting_lot_choice",
+    current_state: 'awaiting_lot_choice',
   });
 
-  return "I found these lots:\n" + lines.join("\n") + "\n\nReply with a number.";
+  return 'I found these lots:\n' + lines.join('\n') + '\n\nReply with a number.';
 }
 
 async function handleLotChoiceState(conversation, text) {
   const n = parseInt(text.trim(), 10);
   if (Number.isNaN(n) || n < 1) {
-    return "Reply with a valid number from the list.";
+    return 'Reply with a valid number from the list.';
   }
 
-  const input = conversation.location_raw_input || "";
+  const input = conversation.location_raw_input || '';
   const parts = input.split(/\s+/);
   const city = parts[0];
   const state = parts[1] || null;
 
   let q = supabase
-    .from("lots")
-    .select("*")
-    .eq("is_active", true)
-    .ilike("city", `${city}%`);
+    .from('lots')
+    .select('*')
+    .eq('is_active', true)
+    .ilike('city', `${city}%`);
 
-  if (state) q = q.ilike("state", `${state}%`);
+  if (state) q = q.ilike('state', `${state}%`);
 
   const { data: lots, error: lotsErr } = await q;
   if (lotsErr) {
-    console.error("Error refetching lots for lot choice:", lotsErr);
+    console.error('Error refetching lots for lot choice:', lotsErr);
   }
 
   const limited = (lots || []).slice(0, 5);
-  if (n > limited.length) return "Please choose a valid number.";
+  if (n > limited.length) return 'Please choose a valid number.';
 
   const chosen = limited[n - 1];
 
   await updateConversation(conversation.id, {
     lot_id: chosen.id,
-    current_state: "awaiting_name",
+    current_state: 'awaiting_name',
   });
 
   return (
     `You’re booking: ${chosen.name}${
-      chosen.region_label ? " – " + chosen.region_label : ""
-    }.\n` + "What’s your first and last name?"
+      chosen.region_label ? ' – ' + chosen.region_label : ''
+    }.\n` + 'What’s your first and last name?'
   );
 }
 
 async function handleNameState(conversation, text) {
   const full = text.trim();
-  if (!full || full.length < 2) return "Please send your full name.";
+  if (!full || full.length < 2) return 'Please send your full name.';
 
   await updateConversation(conversation.id, {
     driver_full_name: full,
-    current_state: "awaiting_truck_type",
+    current_state: 'awaiting_truck_type',
   });
 
   return (
-    "What are you parking?\n" +
-    "1 = Semi\n" +
-    "2 = Bobtail\n" +
-    "3 = Hotshot\n" +
-    "4 = Other\n" +
-    "Reply with a number."
+    'What are you parking?\n' +
+    '1 = Semi\n' +
+    '2 = Bobtail\n' +
+    '3 = Hotshot\n' +
+    '4 = Other\n' +
+    'Reply with a number.'
   );
 }
 
 async function handleTruckTypeState(conversation, text) {
   const n = parseInt(text.trim(), 10);
   const types = {
-    1: "semi",
-    2: "bobtail",
-    3: "hotshot",
-    4: "other",
+    1: 'semi',
+    2: 'bobtail',
+    3: 'hotshot',
+    4: 'other',
   };
   const truckType = types[n];
-  if (!truckType) return "Reply 1, 2, 3, or 4.";
+  if (!truckType) return 'Reply 1, 2, 3, or 4.';
 
   await updateConversation(conversation.id, {
     truck_type: truckType,
-    current_state: "awaiting_make_model",
+    current_state: 'awaiting_make_model',
   });
 
   return 'Truck make & model? (e.g. "Freightliner Cascadia")';
@@ -363,11 +359,11 @@ async function handleTruckTypeState(conversation, text) {
 
 async function handleMakeModelState(conversation, text) {
   const v = text.trim();
-  if (!v || v.length < 2) return "Please send truck make & model.";
+  if (!v || v.length < 2) return 'Please send truck make & model.';
 
   await updateConversation(conversation.id, {
     truck_make_model: v,
-    current_state: "awaiting_plate",
+    current_state: 'awaiting_plate',
   });
 
   return 'Plate (state + number)? (e.g. "MT 7-XYZ456")';
@@ -375,49 +371,50 @@ async function handleMakeModelState(conversation, text) {
 
 async function handlePlateState(conversation, text) {
   const v = text.trim();
-  if (!v || v.length < 2) return "Please send a valid license plate.";
+  if (!v || v.length < 2) return 'Please send a valid license plate.';
 
   await updateConversation(conversation.id, {
     license_plate_raw: v,
-    current_state: "awaiting_stay_option",
+    current_state: 'awaiting_stay_option',
   });
 
   return (
-    "How long are you staying?\n" +
-    "1 = 1 night\n" +
-    "2 = 7 nights\n" +
-    "3 = 30 nights\n" +
-    "4 = Other\n" +
-    "Reply with a number."
+    'How long are you staying?\n' +
+    '1 = 1 night\n' +
+    '2 = 7 nights\n' +
+    '3 = 30 nights\n' +
+    '4 = Other\n' +
+    'Reply with a number.'
   );
 }
 
 async function handleStayOptionState(conversation, text) {
   const n = parseInt(text.trim(), 10);
-  if (![1, 2, 3, 4].includes(n)) return "Reply 1–4.";
+  if (![1, 2, 3, 4].includes(n)) return 'Reply 1–4.';
 
-  let stayType, nights;
+  let stayType;
+  let nights;
 
   if (n === 1) {
-    stayType = "overnight";
+    stayType = 'overnight';
     nights = 1;
   } else if (n === 2) {
-    stayType = "weekly";
+    stayType = 'weekly';
     nights = 7;
   } else if (n === 3) {
-    stayType = "monthly";
+    stayType = 'monthly';
     nights = 30;
   } else {
     await updateConversation(conversation.id, {
-      current_state: "awaiting_custom_nights",
+      current_state: 'awaiting_custom_nights',
     });
-    return "How many nights?";
+    return 'How many nights?';
   }
 
   await updateConversation(conversation.id, {
     stay_type: stayType,
     nights,
-    current_state: "awaiting_summary_confirmation",
+    current_state: 'awaiting_summary_confirmation',
   });
 
   return buildSummaryPrompt(conversation.id, stayType, nights);
@@ -425,76 +422,74 @@ async function handleStayOptionState(conversation, text) {
 
 async function handleCustomNightsState(conversation, text) {
   const n = parseInt(text.trim(), 10);
-  if (Number.isNaN(n) || n < 1 || n > 90) return "Enter 1–90 nights.";
+  if (Number.isNaN(n) || n < 1 || n > 90) return 'Enter 1–90 nights.';
 
   await updateConversation(conversation.id, {
-    stay_type: "custom",
+    stay_type: 'custom',
     nights: n,
-    current_state: "awaiting_summary_confirmation",
+    current_state: 'awaiting_summary_confirmation',
   });
 
-  return buildSummaryPrompt(conversation.id, "custom", n);
+  return buildSummaryPrompt(conversation.id, 'custom', n);
 }
 
 async function buildSummaryPrompt(conversationId, stayType, nights) {
   const { data: conv, error: convErr } = await supabase
-    .from("conversations")
-    .select("*")
-    .eq("id", conversationId)
+    .from('conversations')
+    .select('*')
+    .eq('id', conversationId)
     .single();
 
   if (convErr) {
-    console.error("Error loading conversation for summary:", convErr);
+    console.error('Error loading conversation for summary:', convErr);
     return "We couldn't build your summary. Try again in a moment.";
   }
 
   const { data: lot, error: lotErr } = await supabase
-    .from("lots")
-    .select("*")
-    .eq("id", conv.lot_id)
+    .from('lots')
+    .select('*')
+    .eq('id', conv.lot_id)
     .single();
 
   if (lotErr) {
-    console.error("Error loading lot for summary:", lotErr);
+    console.error('Error loading lot for summary:', lotErr);
     return "We couldn't load the lot details. Try again shortly.";
   }
 
   const pricing = computePricing(lot, stayType, nights);
   const totalDollars = (pricing.total_cents / 100).toFixed(2);
 
-  // Save quoted price
   await updateConversation(conversationId, {
     quoted_total_cents: pricing.total_cents,
   });
 
   return (
-    "Here’s your booking:\n" +
-    `• Lot: ${lot.name}${lot.region_label ? " – " + lot.region_label : ""}\n` +
+    'Here’s your booking:\n' +
+    `• Lot: ${lot.name}${lot.region_label ? ' – ' + lot.region_label : ''}\n` +
     `• Name: ${conv.driver_full_name}\n` +
     `• Truck: ${conv.truck_type} – ${conv.truck_make_model}\n` +
     `• Plate: ${conv.license_plate_raw}\n` +
     `• Stay: ${nights} night(s)\n` +
     `• Total: $${totalDollars}\n\n` +
-    "Reply YES to get your payment link, or NO to cancel."
+    'Reply YES to get your payment link, or NO to cancel.'
   );
 }
 
 async function handleSummaryConfirmState(conversation, text) {
   const upper = text.trim().toUpperCase();
 
-  if (upper === "NO" || upper === "N") {
+  if (upper === 'NO' || upper === 'N') {
     await updateConversation(conversation.id, {
-      current_state: "cancelled",
+      current_state: 'cancelled',
       is_active: false,
     });
-    return "No problem, booking cancelled.";
+    return 'No problem, booking cancelled.';
   }
 
-  if (!(upper === "YES" || upper === "Y")) {
-    return "Reply YES to get your payment link, or NO to cancel.";
+  if (!(upper === 'YES' || upper === 'Y')) {
+    return 'Reply YES to get your payment link, or NO to cancel.';
   }
 
-  // YES → create booking + Stripe session
   return createBooking(conversation);
 }
 
@@ -503,27 +498,25 @@ async function handleSummaryConfirmState(conversation, text) {
 // -----------------------------------------------------
 
 async function createBooking(conversation) {
-  // Reload convo with all fields
   const { data: conv, error: convErr } = await supabase
-    .from("conversations")
-    .select("*")
-    .eq("id", conversation.id)
+    .from('conversations')
+    .select('*')
+    .eq('id', conversation.id)
     .single();
 
   if (convErr) {
-    console.error("Error reloading conversation for booking:", convErr);
+    console.error('Error reloading conversation for booking:', convErr);
     return "We couldn't create your booking. Please try again.";
   }
 
-  // Fetch lot
   const { data: lot, error: lotErr } = await supabase
-    .from("lots")
-    .select("*")
-    .eq("id", conv.lot_id)
+    .from('lots')
+    .select('*')
+    .eq('id', conv.lot_id)
     .single();
 
   if (lotErr) {
-    console.error("Error loading lot for booking:", lotErr);
+    console.error('Error loading lot for booking:', lotErr);
     return "We couldn't find that lot. Try again.";
   }
 
@@ -536,7 +529,7 @@ async function createBooking(conversation) {
   const endDate = end.toISOString().slice(0, 10);
 
   const { data: booking, error: bookingErr } = await supabase
-    .from("bookings")
+    .from('bookings')
     .insert({
       conversation_id: conv.id,
       lot_id: conv.lot_id,
@@ -555,26 +548,25 @@ async function createBooking(conversation) {
       subtotal_cents: pricing.subtotal_cents,
       deposit_hold_cents: pricing.deposit_hold_cents,
       total_cents: pricing.total_cents,
-      currency: "usd",
-      status: "pending_payment",
+      currency: 'usd',
+      status: 'pending_payment',
     })
     .select()
     .single();
 
   if (bookingErr) {
-    console.error("Supabase insert booking error:", bookingErr);
+    console.error('Supabase insert booking error:', bookingErr);
     return "We couldn't create your booking. Please try again.";
   }
 
-  // Create Stripe Checkout Session
   const session = await stripe.checkout.sessions.create({
-    mode: "payment",
-    payment_method_types: ["card"],
+    mode: 'payment',
+    payment_method_types: ['card'],
     line_items: [
       {
         quantity: 1,
         price_data: {
-          currency: "usd",
+          currency: 'usd',
           unit_amount: pricing.total_cents,
           product_data: {
             name: `Truck Parking – ${lot.name}`,
@@ -587,26 +579,25 @@ async function createBooking(conversation) {
       booking_id: booking.id,
     },
     success_url:
-      process.env.CHECKOUT_SUCCESS_URL || "https://openyardpark.com/success",
+      process.env.CHECKOUT_SUCCESS_URL || 'https://openyardpark.com/success',
     cancel_url:
-      process.env.CHECKOUT_CANCEL_URL || "https://openyardpark.com/cancel",
+      process.env.CHECKOUT_CANCEL_URL || 'https://openyardpark.com/cancel',
   });
 
-  // Save session id
   await supabase
-    .from("bookings")
+    .from('bookings')
     .update({
       stripe_session_id: session.id,
       updated_at: new Date().toISOString(),
     })
-    .eq("id", booking.id);
+    .eq('id', booking.id);
 
   await updateConversation(conv.id, {
     booking_id: booking.id,
-    current_state: "awaiting_payment",
+    current_state: 'awaiting_payment',
   });
 
-  await logSms(conv.id, conv.driver_phone_e164, "outbound", session.url);
+  await logSms(conv.id, conv.driver_phone_e164, 'outbound', session.url);
 
   return "Here’s your secure payment link:\n" + session.url;
 }
@@ -621,10 +612,10 @@ function computePricing(lot, stayType, nights) {
 
   let subtotal = nightly * n;
 
-  if (stayType === "weekly" && lot.weekly_rate_cents) {
+  if (stayType === 'weekly' && lot.weekly_rate_cents) {
     subtotal = lot.weekly_rate_cents;
   }
-  if (stayType === "monthly" && lot.monthly_rate_cents) {
+  if (stayType === 'monthly' && lot.monthly_rate_cents) {
     subtotal = lot.monthly_rate_cents;
   }
 
@@ -642,11 +633,11 @@ function computePricing(lot, stayType, nights) {
 }
 
 // -----------------------------------------------------
-// STRIPE WEBHOOK
+// STRIPE WEBHOOK  (confirm + schedule review SMS)
 // -----------------------------------------------------
 
 async function stripeWebhookHandler(req, res) {
-  const sig = req.headers["stripe-signature"];
+  const sig = req.headers['stripe-signature'];
 
   let event;
   try {
@@ -656,71 +647,70 @@ async function stripeWebhookHandler(req, res) {
       process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (err) {
-    console.error("Stripe signature error:", err.message);
-    return res.status(400).send("Invalid signature");
+    console.error('Stripe signature error:', err.message);
+    return res.status(400).send('Invalid signature');
   }
 
-  if (event.type === "checkout.session.completed") {
+  if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const bookingId = session.metadata && session.metadata.booking_id;
 
     if (!bookingId) {
-      console.warn("Stripe: missing booking_id");
-      return res.send("ok");
+      console.warn('Stripe: missing booking_id');
+      return res.send('ok');
     }
 
     const nowIso = new Date().toISOString();
 
-    // Update booking
     const { data: rows, error: updErr } = await supabase
-      .from("bookings")
+      .from('bookings')
       .update({
-        status: "confirmed",
+        status: 'confirmed',
         paid_at: nowIso,
         stripe_payment_intent_id: session.payment_intent,
         stripe_customer_id: session.customer,
       })
-      .eq("id", bookingId)
+      .eq('id', bookingId)
       .select()
       .limit(1);
 
     if (updErr || !rows || rows.length === 0) {
-      console.error("Error updating booking on payment:", updErr);
-      return res.send("ok");
+      console.error('Error updating booking on payment:', updErr);
+      return res.send('ok');
     }
 
     const booking = rows[0];
 
-    // Mark conversation inactive/completed so they can book again later
+    // Mark conversation inactive/completed so they can book again
     await supabase
-      .from("conversations")
+      .from('conversations')
       .update({
         is_active: false,
-        current_state: "completed",
+        current_state: 'completed',
         updated_at: nowIso,
       })
-      .eq("id", booking.conversation_id);
+      .eq('id', booking.conversation_id);
 
-    // Load lot for instructions + review_url
+    // Load lot for instructions + review_url + time_zone
     const { data: lot, error: lotErr } = await supabase
-      .from("lots")
-      .select("*")
-      .eq("id", booking.lot_id)
+      .from('lots')
+      .select('*')
+      .eq('id', booking.lot_id)
       .single();
 
     if (lotErr) {
-      console.error("Error loading lot for confirmation:", lotErr);
+      console.error('Error loading lot for confirmation:', lotErr);
     }
 
     const instructions =
       lot && lot.parking_instructions
         ? lot.parking_instructions
-        : "Park in marked truck stalls.";
+        : 'Park in marked truck stalls.';
 
     const confirmMsg =
-      "✅ Your booking is confirmed!\n" +
-      `${lot ? lot.name : "OpenYard lot"}${
-        lot && lot.region_label ? " – " + lot.region_label : ""
+      '✅ Your booking is confirmed!\n' +
+      `${lot ? lot.name : 'OpenYard lot'}${
+        lot && lot.region_label ? ' – ' + lot.region_label : ''
       }\n` +
       `Dates: ${booking.start_date} to ${booking.end_date}\n` +
       `Plate: ${booking.license_plate_raw}\n\n` +
@@ -735,45 +725,58 @@ async function stripeWebhookHandler(req, res) {
     await logSms(
       booking.conversation_id,
       booking.driver_phone_e164,
-      "outbound",
+      'outbound',
       confirmMsg
     );
 
-    // Schedule review-nudge SMS ~20 hours later
-    const sendAt = new Date();
-    sendAt.setHours(sendAt.getHours() + 20);
-
+    // Schedule review-nudge SMS for next day at 8pm lot local time
+    const sendAtIso = computeReviewSendAt(lot);
     const driverName = booking.driver_full_name || null;
 
-    await supabase.from("scheduled_messages").insert({
+    await supabase.from('scheduled_messages').insert({
       booking_id: booking.id,
       lot_id: booking.lot_id,
       driver_phone_e164: booking.driver_phone_e164,
       driver_full_name: driverName,
-      message_type: "review_nudge",
-      send_at: sendAt.toISOString(),
+      message_type: 'review_nudge',
+      send_at: sendAtIso,
     });
   }
 
-  res.send("ok");
+  res.send('ok');
 }
 
 // -----------------------------------------------------
-// Scheduled review messages
+// Scheduling helpers
 // -----------------------------------------------------
+
+function computeReviewSendAt(lot) {
+  const lotTz = (lot && lot.time_zone) || 'America/Denver';
+
+  // Now in lot's local time
+  const nowLot = DateTime.now().setZone(lotTz);
+
+  // Next calendar day at 20:00 local
+  const nextDay8pmLot = nowLot
+    .plus({ days: 1 })
+    .startOf('day')
+    .plus({ hours: 20 });
+
+  return nextDay8pmLot.toUTC().toISO();
+}
 
 async function runDueReviewMessages() {
   const nowIso = new Date().toISOString();
 
   const { data: due, error: dueErr } = await supabase
-    .from("scheduled_messages")
-    .select("*")
-    .is("sent_at", null)
-    .lte("send_at", nowIso)
+    .from('scheduled_messages')
+    .select('*')
+    .is('sent_at', null)
+    .lte('send_at', nowIso)
     .limit(10);
 
   if (dueErr) {
-    console.error("Error fetching scheduled messages:", dueErr);
+    console.error('Error fetching scheduled messages:', dueErr);
     return;
   }
 
@@ -784,33 +787,44 @@ async function runDueReviewMessages() {
   for (const msg of due) {
     try {
       const { data: lot, error: lotErr } = await supabase
-        .from("lots")
-        .select("name, region_label, review_url")
-        .eq("id", msg.lot_id)
+        .from('lots')
+        .select('name, region_label, review_url')
+        .eq('id', msg.lot_id)
         .single();
 
       if (lotErr) {
-        console.error("Error loading lot for review nudge:", msg.id, lotErr);
+        console.error('Error loading lot for review nudge:', msg.id, lotErr);
       }
 
       const reviewUrl = lot && lot.review_url ? lot.review_url : null;
 
-      // If no review URL, mark as "sent" with note so we don't retry forever
       if (!reviewUrl) {
         await supabase
-          .from("scheduled_messages")
+          .from('scheduled_messages')
           .update({
             sent_at: new Date().toISOString(),
-            last_error: "no review_url on lot",
+            last_error: 'no review_url on lot',
           })
-          .eq("id", msg.id);
+          .eq('id', msg.id);
         continue;
       }
 
-      // First name from "Jim Truckerson"
-      let firstName = "driver";
+      // Fetch booking to get conversation_id
+      const { data: bookingRows, error: bookingErr } = await supabase
+        .from('bookings')
+        .select('conversation_id')
+        .eq('id', msg.booking_id)
+        .limit(1);
+
+      if (bookingErr) {
+        console.error('Error loading booking for review nudge:', msg.id, bookingErr);
+      }
+
+      const booking = bookingRows && bookingRows[0];
+
+      let firstName = 'driver';
       if (msg.driver_full_name) {
-        firstName = msg.driver_full_name.trim().split(/\s+/)[0] || "driver";
+        firstName = msg.driver_full_name.trim().split(/\s+/)[0] || 'driver';
       }
 
       const body =
@@ -825,27 +839,27 @@ async function runDueReviewMessages() {
       });
 
       await supabase
-        .from("scheduled_messages")
+        .from('scheduled_messages')
         .update({
           sent_at: new Date().toISOString(),
           last_error: null,
         })
-        .eq("id", msg.id);
+        .eq('id', msg.id);
 
       await logSms(
-        msg.booking_id,
+        booking ? booking.conversation_id : null,
         msg.driver_phone_e164,
-        "outbound",
+        'outbound',
         body
       );
     } catch (err) {
-      console.error("Error sending scheduled message", msg.id, err);
+      console.error('Error sending scheduled message', msg.id, err);
       await supabase
-        .from("scheduled_messages")
+        .from('scheduled_messages')
         .update({
           last_error: err.message,
         })
-        .eq("id", msg.id);
+        .eq('id', msg.id);
     }
   }
 }
@@ -855,7 +869,7 @@ async function runDueReviewMessages() {
 // -----------------------------------------------------
 
 async function logSms(conversationId, phone, direction, msg, raw) {
-  await supabase.from("sms_messages").insert({
+  await supabase.from('sms_messages').insert({
     conversation_id: conversationId,
     driver_phone_e164: phone,
     direction,
@@ -866,26 +880,29 @@ async function logSms(conversationId, phone, direction, msg, raw) {
 
 async function updateConversation(id, fields) {
   await supabase
-    .from("conversations")
+    .from('conversations')
     .update({
       ...fields,
       updated_at: new Date().toISOString(),
     })
-    .eq("id", id);
+    .eq('id', id);
 }
 
 async function deactivateActiveConversations(phone) {
   await supabase
-    .from("conversations")
+    .from('conversations')
     .update({
       is_active: false,
-      current_state: "cancelled",
+      current_state: 'cancelled',
     })
-    .eq("driver_phone_e164", phone)
-    .eq("is_active", true);
+    .eq('driver_phone_e164', phone)
+    .eq('is_active', true);
 }
 
 // -----------------------------------------------------
+// Start server
+// -----------------------------------------------------
+
 app.listen(port, () =>
   console.log(`OpenYard backend listening on port ${port}`)
 );
