@@ -868,6 +868,11 @@ async function runDueReviewMessages() {
 // Utilities
 // -----------------------------------------------------
 
+function computeReviewSendAt(lot) {
+  // TEST MODE: send review SMS in 2 minutes
+  return DateTime.utc().plus({ minutes: 2 }).toISO();
+}
+
 async function logSms(conversationId, phone, direction, msg, raw) {
   await supabase.from('sms_messages').insert({
     conversation_id: conversationId,
