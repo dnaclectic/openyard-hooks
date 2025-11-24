@@ -29,6 +29,52 @@ const twilioClient = twilio(
 );
 
 // -----------------------------------------------------
+// Simple rate limiting (per phone #, in-memory)
+// -----------------------------------------------------
+
+const rateLimitWindowMs = 60_000; // 1 minute
+const rateLimitMaxMessages = 10;
+const rateLimitMap = new Map();
+
+function isRateLimited(phone) {
+  if (!phone) return false;
+
+  const now = Date.now();
+  const existing = rateLimitMap.get(phone);
+
+  if (!existing || now - existing.start > rateLimitWindowMs) {
+    rateLimitMap.set(phone, { start: now, count: 1 });
+    return false;
+  }
+
+  existing.count += 1;
+  if (existing.count > rateLimitMaxMessages) {
+    return true;
+  }
+
+  return false;
+}
+
+// -----------------------------------------------------
+// Simple owner alert helper
+// -----------------------------------------------------
+
+async function notifyOwnerAlert(message) {
+  const ownerPhone = process.env.ALERT_PHONE_E164;
+  if (!ownerPhone) return;
+
+  try {
+    await twilioClient.messages.create({
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: ownerPhone,
+      body: `[OpenYard Alert] ${message}`,
+    });
+  } catch (err) {
+    console.error('Error sending owner alert:', err);
+  }
+}
+
+// -----------------------------------------------------
 // Stripe webhook (must come BEFORE body parsers)
 // -----------------------------------------------------
 app.post(
@@ -44,14 +90,44 @@ app.use(express.json());
 // Twilio inbound SMS
 app.post('/webhooks/twilio', twilioWebhookHandler);
 
-// Healthcheck (also runs due scheduled messages)
+// Healthcheck (also runs due scheduled messages + idle expiry)
 app.get('/healthz', async (req, res) => {
   try {
+    await expireIdleConversations(30); // 30 min idle timeout
     await runDueReviewMessages();
     return res.json({ ok: true });
   } catch (err) {
     console.error('healthz error:', err);
     return res.status(500).json({ ok: false });
+  }
+});
+
+// Lightweight status endpoint for debugging
+app.get('/status', async (req, res) => {
+  try {
+    const nowIso = new Date().toISOString();
+
+    const { count: activeConvosCount, error: convErr } = await supabase
+      .from('conversations')
+      .select('*', { count: 'exact', head: true })
+      .eq('is_active', true);
+
+    const { count: pendingScheduledCount, error: schedErr } = await supabase
+      .from('scheduled_messages')
+      .select('*', { count: 'exact', head: true })
+      .is('sent_at', null)
+      .lte('send_at', nowIso);
+
+    return res.json({
+      ok: true,
+      serverTime: nowIso,
+      uptimeSeconds: Math.floor(process.uptime()),
+      activeConversations: convErr ? null : activeConvosCount || 0,
+      dueScheduledMessages: schedErr ? null : pendingScheduledCount || 0,
+    });
+  } catch (err) {
+    console.error('/status error:', err);
+    return res.status(500).json({ ok: false, error: 'status_failed' });
   }
 });
 
@@ -61,9 +137,9 @@ app.get('/healthz', async (req, res) => {
 
 function withCommandsFooter(mainText) {
   const commandsBlock =
-    '\n\nCommands:\n\n' +
-    'BOOK – new booking\n\n' +
-    'RESET – start over\n\n' +
+    '\n\nCommands:\n' +
+    'BOOK – new booking\n' +
+    'RESET – start over\n' +
     'SUPPORT – help';
 
   return mainText + commandsBlock;
@@ -82,6 +158,15 @@ async function twilioWebhookHandler(req, res) {
     body,
   });
 
+  // Basic rate limiting
+  if (isRateLimited(from)) {
+    const twiml = new twilio.twiml.MessagingResponse();
+    twiml.message(
+      'You’re sending messages too quickly. Please wait a moment and try again.'
+    );
+    return res.type('text/xml').send(twiml.toString());
+  }
+
   let replyText = 'Sorry, something broke on our end.';
 
   try {
@@ -90,6 +175,7 @@ async function twilioWebhookHandler(req, res) {
     console.error('handleIncomingSms error:', err);
     replyText =
       'Oops, something went wrong. Please try again in a moment or text SUPPORT for help.';
+    await notifyOwnerAlert(`Error in handleIncomingSms: ${err.message}`);
   }
 
   const twiml = new twilio.twiml.MessagingResponse();
@@ -121,7 +207,7 @@ async function handleIncomingSms(phone, text, rawPayload) {
       '2) We ask where they want to park (city/exit or lot code).\n' +
       '3) They pick your lot, then enter name, truck, plate, and nights.\n' +
       '4) We text them a secure Stripe payment link to pay by card.\n' +
-      '5) After payment, they get a confirmation + parking instructions.\n' +
+      '5) After payment, they get a confirmation with parking instructions.\n' +
       '6) The next evening, we send them a quick review link for your lot.\n\n' +
       'If you’d like a live walkthrough, text SUPPORT and we’ll set up a quick demo call.'
     );
@@ -132,10 +218,10 @@ async function handleIncomingSms(phone, text, rawPayload) {
     await logSms(null, phone, 'inbound', text, rawPayload);
 
     return (
-      'OpenYard commands:\n\n' +
-      'BOOK – start a new reservation\n\n' +
-      'RESET – clear your info and start over\n\n' +
-      'CANCEL – cancel your active booking\n\n' +
+      'OpenYard commands:\n' +
+      'BOOK – start a new reservation\n' +
+      'RESET – clear your info and start over\n' +
+      'CANCEL – cancel your active booking\n' +
       'SUPPORT – text a human (8a–8p MT)'
     );
   }
@@ -145,9 +231,9 @@ async function handleIncomingSms(phone, text, rawPayload) {
     await logSms(null, phone, 'inbound', text, rawPayload);
 
     return (
-      'For help with OpenYard, you can:\n\n' +
-      'BOOK – start a new reservation\n\n' +
-      'RESET – clear and start over\n\n' +
+      'For help with OpenYard, you can:\n' +
+      'BOOK – start a new reservation\n' +
+      'RESET – clear and start over\n' +
       'SUPPORT – text a human (8a–8p MT)'
     );
   }
@@ -191,7 +277,7 @@ async function handleIncomingSms(phone, text, rawPayload) {
     // Fallback if ALERT_PHONE_E164 not set
     return (
       'Support is not fully configured yet.\n' +
-      'Please email support@openyardpark.com, or text BOOK to start a new reservation.'
+      'Please email alex@openyardpark.com, or text BOOK to start a new reservation.'
     );
   }
 
@@ -226,19 +312,22 @@ async function handleIncomingSms(phone, text, rawPayload) {
       conversation = null;
     }
 
+    const nowIso = new Date().toISOString();
+
     const { data: newConv, error: newConvErr } = await supabase
       .from('conversations')
       .insert({
         driver_phone_e164: phone,
         current_state: 'awaiting_location_or_lot_code',
         is_active: true,
-        last_inbound_at: new Date().toISOString(),
+        last_inbound_at: nowIso,
       })
       .select()
       .single();
 
     if (newConvErr) {
       console.error('Error creating conversation:', newConvErr);
+      await notifyOwnerAlert(`Error creating conversation: ${newConvErr.message}`);
       return 'Something went wrong starting your booking. Please try again in a minute.';
     }
 
@@ -265,11 +354,15 @@ async function handleIncomingSms(phone, text, rawPayload) {
   }
 
   //
-  // We *do* have an active conversation – log the SMS and route by state
+  // We *do* have an active conversation – log the SMS, update last_inbound, and route by state
   //
   await logSms(conversation.id, phone, 'inbound', text, rawPayload);
+  await updateConversation(conversation.id, {
+    last_inbound_at: new Date().toISOString(),
+  });
 
   const state = conversation.current_state;
+  const trimmedUpper = (text || '').trim().toUpperCase();
 
   switch (state) {
     case 'awaiting_location_or_lot_code':
@@ -300,10 +393,7 @@ async function handleIncomingSms(phone, text, rawPayload) {
       return handleSummaryConfirmState(conversation, text);
 
     case 'awaiting_payment':
-      return (
-        'Your payment link was already sent.\n' +
-        'Complete payment to confirm, or text RESET to start over.'
-      );
+      return handleAwaitingPaymentState(conversation, trimmedUpper);
 
     default:
       return 'Text BOOK to start a new booking.';
@@ -554,6 +644,9 @@ async function buildSummaryPrompt(conversationId, stayType, nights) {
 
   if (convErr) {
     console.error('Error loading conversation for summary:', convErr);
+    await notifyOwnerAlert(
+      `Error loading conversation for summary: ${convErr.message}`
+    );
     return (
       "We couldn't build your summary. Try again in a moment or text SUPPORT for help."
     );
@@ -567,6 +660,7 @@ async function buildSummaryPrompt(conversationId, stayType, nights) {
 
   if (lotErr) {
     console.error('Error loading lot for summary:', lotErr);
+    await notifyOwnerAlert(`Error loading lot for summary: ${lotErr.message}`);
     return (
       "We couldn't load the lot details. Try again shortly or text SUPPORT for help."
     );
@@ -610,6 +704,95 @@ async function handleSummaryConfirmState(conversation, text) {
   return createBooking(conversation);
 }
 
+// Handle lost / re-requested payment link while awaiting payment
+async function handleAwaitingPaymentState(conversation, trimmedUpper) {
+  // If they ask for link again, try to re-send
+  const wantsLink = ['LINK', 'PAY', 'PAYMENT', 'YES', 'Y', 'RESEND'].includes(
+    trimmedUpper
+  );
+
+  if (!wantsLink) {
+    return (
+      'Your payment link was already sent.\n' +
+      'Complete payment to confirm, or text RESET to start over.'
+    );
+  }
+
+  if (!conversation.booking_id) {
+    return (
+      'We tried to find your payment link but ran into an issue.\n' +
+      'Text RESET to start a fresh booking.'
+    );
+  }
+
+  const { data: bookingRows, error: bookingErr } = await supabase
+    .from('bookings')
+    .select('*')
+    .eq('id', conversation.booking_id)
+    .limit(1);
+
+  if (bookingErr || !bookingRows || bookingRows.length === 0) {
+    console.error('Error loading booking in awaiting_payment:', bookingErr);
+    await notifyOwnerAlert(
+      `Error loading booking in awaiting_payment: ${
+        bookingErr ? bookingErr.message : 'not found'
+      }`
+    );
+    return (
+      'We hit a snag trying to find your payment.\n' +
+      'Your card has not been charged. Text RESET to start over.'
+    );
+  }
+
+  const booking = bookingRows[0];
+
+  if (booking.status === 'confirmed') {
+    return (
+      'Your booking is already confirmed and paid.\n' +
+      `Dates: ${booking.start_date} to ${booking.end_date}\n` +
+      `Plate: ${booking.license_plate_raw}`
+    );
+  }
+
+  if (booking.status !== 'pending_payment' || !booking.stripe_session_id) {
+    return (
+      'We could not re-open your payment link.\n' +
+      'Text RESET to start a new booking.'
+    );
+  }
+
+  // Re-fetch session from Stripe to get fresh URL
+  try {
+    const session = await stripe.checkout.sessions.retrieve(
+      booking.stripe_session_id
+    );
+    if (!session || !session.url) {
+      return (
+        'We could not re-open your payment link.\n' +
+        'Text RESET to start a new booking.'
+      );
+    }
+
+    await logSms(
+      booking.conversation_id,
+      booking.driver_phone_e164,
+      'outbound',
+      session.url
+    );
+
+    return 'Here’s your secure payment link:\n' + session.url;
+  } catch (err) {
+    console.error('Error retrieving Stripe session for resend:', err);
+    await notifyOwnerAlert(
+      `Error retrieving Stripe session for resend: ${err.message}`
+    );
+    return (
+      'We had trouble re-opening your payment link.\n' +
+      'Your card has not been charged. Text RESET to start over.'
+    );
+  }
+}
+
 // -----------------------------------------------------
 // CREATE BOOKING + STRIPE CHECKOUT
 // -----------------------------------------------------
@@ -623,6 +806,9 @@ async function createBooking(conversation) {
 
   if (convErr) {
     console.error('Error reloading conversation for booking:', convErr);
+    await notifyOwnerAlert(
+      `Error reloading conversation for booking: ${convErr.message}`
+    );
     return "We couldn't create your booking. Please try again.";
   }
 
@@ -634,6 +820,9 @@ async function createBooking(conversation) {
 
   if (lotErr) {
     console.error('Error loading lot for booking:', lotErr);
+    await notifyOwnerAlert(
+      `Error loading lot for booking: ${lotErr.message}`
+    );
     return "We couldn't find that lot. Try again.";
   }
 
@@ -673,6 +862,9 @@ async function createBooking(conversation) {
 
   if (bookingErr) {
     console.error('Supabase insert booking error:', bookingErr);
+    await notifyOwnerAlert(
+      `Supabase insert booking error: ${bookingErr.message}`
+    );
     return "We couldn't create your booking. Please try again.";
   }
 
@@ -765,6 +957,7 @@ async function stripeWebhookHandler(req, res) {
     );
   } catch (err) {
     console.error('Stripe signature error:', err.message);
+    await notifyOwnerAlert(`Stripe signature error: ${err.message}`);
     return res.status(400).send('Invalid signature');
   }
 
@@ -774,6 +967,7 @@ async function stripeWebhookHandler(req, res) {
 
     if (!bookingId) {
       console.warn('Stripe: missing booking_id');
+      await notifyOwnerAlert('Stripe checkout.session.completed missing booking_id');
       return res.send('ok');
     }
 
@@ -793,6 +987,11 @@ async function stripeWebhookHandler(req, res) {
 
     if (updErr || !rows || rows.length === 0) {
       console.error('Error updating booking on payment:', updErr);
+      await notifyOwnerAlert(
+        `Error updating booking on payment: ${
+          updErr ? updErr.message : 'no rows returned'
+        }`
+      );
       return res.send('ok');
     }
 
@@ -817,6 +1016,9 @@ async function stripeWebhookHandler(req, res) {
 
     if (lotErr) {
       console.error('Error loading lot for confirmation:', lotErr);
+      await notifyOwnerAlert(
+        `Error loading lot for confirmation: ${lotErr.message}`
+      );
     }
 
     const instructions =
@@ -831,7 +1033,8 @@ async function stripeWebhookHandler(req, res) {
       }\n` +
       `Dates: ${booking.start_date} to ${booking.end_date}\n` +
       `Plate: ${booking.license_plate_raw}\n\n` +
-      `Instructions:\n${instructions}`;
+      `Instructions:\n${instructions}\n\n` +
+      'Keep this text as your receipt.';
 
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER,
@@ -893,6 +1096,7 @@ async function runDueReviewMessages() {
 
   if (dueErr) {
     console.error('Error fetching scheduled messages:', dueErr);
+    await notifyOwnerAlert(`Error fetching scheduled messages: ${dueErr.message}`);
     return;
   }
 
@@ -910,6 +1114,9 @@ async function runDueReviewMessages() {
 
       if (lotErr) {
         console.error('Error loading lot for review nudge:', msg.id, lotErr);
+        await notifyOwnerAlert(
+          `Error loading lot for review nudge (msg ${msg.id}): ${lotErr.message}`
+        );
       }
 
       const reviewUrl = lot && lot.review_url ? lot.review_url : null;
@@ -925,22 +1132,47 @@ async function runDueReviewMessages() {
         continue;
       }
 
-      // Fetch booking to get conversation_id
+      // Fetch booking to get conversation_id and status
       const { data: bookingRows, error: bookingErr } = await supabase
         .from('bookings')
-        .select('conversation_id')
+        .select('conversation_id,status')
         .eq('id', msg.booking_id)
         .limit(1);
 
-      if (bookingErr) {
+      if (bookingErr || !bookingRows || bookingRows.length === 0) {
         console.error(
           'Error loading booking for review nudge:',
           msg.id,
           bookingErr
         );
+        await notifyOwnerAlert(
+          `Error loading booking for review nudge (msg ${msg.id}): ${
+            bookingErr ? bookingErr.message : 'not found'
+          }`
+        );
+        await supabase
+          .from('scheduled_messages')
+          .update({
+            sent_at: new Date().toISOString(),
+            last_error: 'booking not found',
+          })
+          .eq('id', msg.id);
+        continue;
       }
 
-      const booking = bookingRows && bookingRows[0];
+      const booking = bookingRows[0];
+
+      // Only send review if booking is confirmed
+      if (booking.status !== 'confirmed') {
+        await supabase
+          .from('scheduled_messages')
+          .update({
+            sent_at: new Date().toISOString(),
+            last_error: `skipped: booking status = ${booking.status}`,
+          })
+          .eq('id', msg.id);
+        continue;
+      }
 
       let firstName = 'driver';
       if (msg.driver_full_name) {
@@ -967,13 +1199,16 @@ async function runDueReviewMessages() {
         .eq('id', msg.id);
 
       await logSms(
-        booking ? booking.conversation_id : null,
+        booking.conversation_id,
         msg.driver_phone_e164,
         'outbound',
         body
       );
     } catch (err) {
       console.error('Error sending scheduled message', msg.id, err);
+      await notifyOwnerAlert(
+        `Error sending scheduled message ${msg.id}: ${err.message}`
+      );
       await supabase
         .from('scheduled_messages')
         .update({
@@ -981,6 +1216,27 @@ async function runDueReviewMessages() {
         })
         .eq('id', msg.id);
     }
+  }
+}
+
+// Expire idle conversations after N minutes
+async function expireIdleConversations(maxMinutes = 30) {
+  const cutoffIso = new Date(
+    Date.now() - maxMinutes * 60 * 1000
+  ).toISOString();
+
+  const { error } = await supabase
+    .from('conversations')
+    .update({
+      is_active: false,
+      current_state: 'expired',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('is_active', true)
+    .lte('last_inbound_at', cutoffIso);
+
+  if (error) {
+    console.error('Error expiring idle conversations:', error);
   }
 }
 
@@ -1014,6 +1270,7 @@ async function deactivateActiveConversations(phone) {
     .update({
       is_active: false,
       current_state: 'cancelled',
+      updated_at: new Date().toISOString(),
     })
     .eq('driver_phone_e164', phone)
     .eq('is_active', true);
