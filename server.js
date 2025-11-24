@@ -2,14 +2,13 @@
 
 import 'dotenv/config';
 import express from 'express';
-
-import { supabase } from './db/db.js';
-import { withCommandsFooter } from './utils/index.js';
-
 import { stripeWebhookHandler } from './payments/index.js';
 import { twilioWebhookHandler } from './sms/handler.js';
-
-import { runDueReviewMessages } from './scheduler/index.js';
+import {
+  runDueReviewMessages,
+  expireIdleConversations,
+} from './scheduler/index.js';
+import { supabase } from './db/db.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -28,7 +27,7 @@ app.use(express.json());
 // Twilio inbound SMS
 app.post('/webhooks/twilio', twilioWebhookHandler);
 
-// Healthcheck
+// Healthcheck – also runs background tasks
 app.get('/healthz', async (req, res) => {
   try {
     await expireIdleConversations(30);
@@ -40,7 +39,7 @@ app.get('/healthz', async (req, res) => {
   }
 });
 
-// Status endpoint
+// Status endpoint – lightweight observability
 app.get('/status', async (req, res) => {
   try {
     const nowIso = new Date().toISOString();
