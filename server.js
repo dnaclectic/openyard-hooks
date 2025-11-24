@@ -2,10 +2,14 @@
 
 import 'dotenv/config';
 import express from 'express';
+
+import { supabase } from './db/db.js';
+import { withCommandsFooter } from './utils/index.js';
+
 import { stripeWebhookHandler } from './payments/index.js';
 import { twilioWebhookHandler } from './sms/handler.js';
-import { runDueReviewMessages, expireIdleConversations } from './scheduler/index.js';
-import { supabase } from './db/db.js';
+
+import { runDueReviewMessages } from './scheduler/index.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
