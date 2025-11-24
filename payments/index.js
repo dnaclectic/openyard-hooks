@@ -1,90 +1,244 @@
-// utils/index.js
+// payments/index.js
 import 'dotenv/config';
-import twilio from 'twilio';
-import { DateTime } from 'luxon';
+import Stripe from 'stripe';
+import { supabase, logSms, updateConversation } from '../db/db.js';
+import {
+  twilioClient,
+  notifyOwnerAlert,
+  computePricing,
+  computeReviewSendAt,
+} from '../utils/index.js';
 
-export const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2023-10-16',
+});
 
-// ----- Rate limiting -----
+export async function createBooking(conversation) {
+  const { data: conv, error: convErr } = await supabase
+    .from('conversations')
+    .select('*')
+    .eq('id', conversation.id)
+    .single();
 
-const rateLimitWindowMs = 60_000; // 1 minute
-const rateLimitMaxMessages = 10;
-const rateLimitMap = new Map();
-
-export function isRateLimited(phone) {
-  if (!phone) return false;
-
-  const now = Date.now();
-  const existing = rateLimitMap.get(phone);
-
-  if (!existing || now - existing.start > rateLimitWindowMs) {
-    rateLimitMap.set(phone, { start: now, count: 1 });
-    return false;
+  if (convErr) {
+    console.error('Error reloading conversation for booking:', convErr);
+    await notifyOwnerAlert(
+      `Error reloading conversation for booking: ${convErr.message}`
+    );
+    return "We couldn't create your booking. Please try again.";
   }
 
-  existing.count += 1;
-  if (existing.count > rateLimitMaxMessages) {
-    return true;
+  const { data: lot, error: lotErr } = await supabase
+    .from('lots')
+    .select('*')
+    .eq('id', conv.lot_id)
+    .single();
+
+  if (lotErr) {
+    console.error('Error loading lot for booking:', lotErr);
+    await notifyOwnerAlert(`Error loading lot for booking: ${lotErr.message}`);
+    return "We couldn't find that lot. Try again.";
   }
 
-  return false;
+  const pricing = computePricing(lot, conv.stay_type, conv.nights);
+
+  const today = new Date();
+  const startDate = today.toISOString().slice(0, 10);
+  const end = new Date(today);
+  end.setDate(end.getDate() + (conv.nights || 1));
+  const endDate = end.toISOString().slice(0, 10);
+
+  const { data: booking, error: bookingErr } = await supabase
+    .from('bookings')
+    .insert({
+      conversation_id: conv.id,
+      lot_id: conv.lot_id,
+      driver_phone_e164: conv.driver_phone_e164,
+      driver_full_name: conv.driver_full_name,
+      truck_type: conv.truck_type,
+      truck_make_model: conv.truck_make_model,
+      license_plate_raw: conv.license_plate_raw,
+      stay_type: conv.stay_type,
+      nights: conv.nights,
+      start_date: startDate,
+      end_date: endDate,
+      nightly_rate_cents: pricing.nightly_rate_cents,
+      weekly_rate_cents: lot.weekly_rate_cents,
+      monthly_rate_cents: lot.monthly_rate_cents,
+      subtotal_cents: pricing.subtotal_cents,
+      deposit_hold_cents: pricing.deposit_hold_cents,
+      total_cents: pricing.total_cents,
+      currency: 'usd',
+      status: 'pending_payment',
+    })
+    .select()
+    .single();
+
+  if (bookingErr) {
+    console.error('Supabase insert booking error:', bookingErr);
+    await notifyOwnerAlert(`Supabase insert booking error: ${bookingErr.message}`);
+    return "We couldn't create your booking. Please try again.";
+  }
+
+  const session = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    payment_method_types: ['card'],
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: 'usd',
+          unit_amount: pricing.total_cents,
+          product_data: {
+            name: `Truck Parking – ${lot.name}`,
+            description: `${conv.nights} night(s) at ${lot.name}`,
+          },
+        },
+      },
+    ],
+    metadata: {
+      booking_id: booking.id,
+    },
+    success_url:
+      process.env.CHECKOUT_SUCCESS_URL || 'https://openyardpark.com/success',
+    cancel_url:
+      process.env.CHECKOUT_CANCEL_URL || 'https://openyardpark.com/cancel',
+  });
+
+  await supabase
+    .from('bookings')
+    .update({
+      stripe_session_id: session.id,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', booking.id);
+
+  await updateConversation(conv.id, {
+    booking_id: booking.id,
+    current_state: 'awaiting_payment',
+  });
+
+  await logSms(conv.id, conv.driver_phone_e164, 'outbound', session.url);
+
+  return 'Here’s your secure payment link:\n' + session.url;
 }
 
-// ----- Owner alerts -----
+export async function stripeWebhookHandler(req, res) {
+  const sig = req.headers['stripe-signature'];
 
-export async function notifyOwnerAlert(message) {
-  const ownerPhone = process.env.ALERT_PHONE_E164;
-  if (!ownerPhone) return;
-
+  let event;
   try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Stripe signature error:', err.message);
+    await notifyOwnerAlert(`Stripe signature error: ${err.message}`);
+    return res.status(400).send('Invalid signature');
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const bookingId = session.metadata && session.metadata.booking_id;
+
+    if (!bookingId) {
+      console.warn('Stripe: missing booking_id');
+      await notifyOwnerAlert(
+        'Stripe checkout.session.completed missing booking_id'
+      );
+      return res.send('ok');
+    }
+
+    const nowIso = new Date().toISOString();
+
+    const { data: rows, error: updErr } = await supabase
+      .from('bookings')
+      .update({
+        status: 'confirmed',
+        paid_at: nowIso,
+        stripe_payment_intent_id: session.payment_intent,
+        stripe_customer_id: session.customer,
+      })
+      .eq('id', bookingId)
+      .select()
+      .limit(1);
+
+    if (updErr || !rows || rows.length === 0) {
+      console.error('Error updating booking on payment:', updErr);
+      await notifyOwnerAlert(
+        `Error updating booking on payment: ${
+          updErr ? updErr.message : 'no rows returned'
+        }`
+      );
+      return res.send('ok');
+    }
+
+    const booking = rows[0];
+
+    await supabase
+      .from('conversations')
+      .update({
+        is_active: false,
+        current_state: 'completed',
+        updated_at: nowIso,
+      })
+      .eq('id', booking.conversation_id);
+
+    const { data: lot, error: lotErr } = await supabase
+      .from('lots')
+      .select('*')
+      .eq('id', booking.lot_id)
+      .single();
+
+    if (lotErr) {
+      console.error('Error loading lot for confirmation:', lotErr);
+      await notifyOwnerAlert(
+        `Error loading lot for confirmation: ${lotErr.message}`
+      );
+    }
+
+    const instructions =
+      lot && lot.parking_instructions
+        ? lot.parking_instructions
+        : 'Park in marked truck stalls.';
+
+    const confirmMsg =
+      '✅ Your booking is confirmed!\n' +
+      `${lot ? lot.name : 'OpenYard lot'}${
+        lot && lot.region_label ? ' – ' + lot.region_label : ''
+      }\n` +
+      `Dates: ${booking.start_date} to ${booking.end_date}\n` +
+      `Plate: ${booking.license_plate_raw}\n\n` +
+      `Instructions:\n${instructions}\n\n` +
+      'Keep this text as your receipt.';
+
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER,
-      to: ownerPhone,
-      body: `[OpenYard Alert] ${message}`,
+      to: booking.driver_phone_e164,
+      body: confirmMsg,
     });
-  } catch (err) {
-    console.error('Error sending owner alert:', err);
+
+    await logSms(
+      booking.conversation_id,
+      booking.driver_phone_e164,
+      'outbound',
+      confirmMsg
+    );
+
+    const sendAtIso = computeReviewSendAt(lot);
+    const driverName = booking.driver_full_name || null;
+
+    await supabase.from('scheduled_messages').insert({
+      booking_id: booking.id,
+      lot_id: booking.lot_id,
+      driver_phone_e164: booking.driver_phone_e164,
+      driver_full_name: driverName,
+      message_type: 'review_nudge',
+      send_at: sendAtIso,
+    });
   }
-}
 
-// ----- Pricing -----
-
-export function computePricing(lot, stayType, nights) {
-  const n = Number(nights || 1);
-  const nightly = lot.nightly_rate_cents || 2500;
-
-  let subtotal = nightly * n;
-
-  if (stayType === 'weekly' && lot.weekly_rate_cents) {
-    subtotal = lot.weekly_rate_cents;
-  }
-  if (stayType === 'monthly' && lot.monthly_rate_cents) {
-    subtotal = lot.monthly_rate_cents;
-  }
-
-  const depositHold = 0;
-  const total = subtotal + depositHold;
-
-  return {
-    nightly_rate_cents: nightly,
-    weekly_rate_cents: lot.weekly_rate_cents,
-    monthly_rate_cents: lot.monthly_rate_cents,
-    subtotal_cents: subtotal,
-    deposit_hold_cents: depositHold,
-    total_cents: total,
-  };
-}
-
-// ----- Review send time -----
-
-export function computeReviewSendAt(lot) {
-  const lotTz = (lot && lot.time_zone) || 'America/Denver';
-
-  const nowLot = DateTime.now().setZone(lotTz);
-  const nextDay8pmLot = nowLot.plus({ days: 1 }).startOf('day').plus({ hours: 20 });
-
-  return nextDay8pmLot.toUTC().toISO();
+  res.send('ok');
 }
