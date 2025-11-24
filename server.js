@@ -89,49 +89,116 @@ async function twilioWebhookHandler(req, res) {
 // -----------------------------------------------------
 
 async function handleIncomingSms(phone, text, rawPayload) {
-  const upper = text.toUpperCase().trim();
+  const upper = (text || "").toUpperCase().trim();
 
-  // GLOBAL COMMANDS
-  if (upper === 'HELP') {
+  //
+  // ──────────────────────────────
+  //  GLOBAL COMMANDS (no state needed)
+  // ──────────────────────────────
+  //
+
+  // HELP – show menu of hotkeys
+  if (upper === "HELP") {
+    await logSms(null, phone, "inbound", text, rawPayload);
+
     return (
-      'OpenYard Truck Parking.\n' +
-      'Text BOOK to start a new reservation.\n' +
-      'Text CANCEL to cancel your active booking.'
+      "OpenYard Truck Parking help:\n" +
+      "\n" +
+      "BOOK   – start a new reservation\n" +
+      "CANCEL – cancel your active booking\n" +
+      "RESET  – clear and start over\n" +
+      "HELP   – show this menu\n" +
+      "SUPPORT – text a human (8a–8p MT)\n" +
+      "\n" +
+      "Reply BOOK to begin a new reservation."
     );
   }
 
-  if (upper === 'STOP' || upper === 'CANCEL') {
+  // CANCEL / STOP – kill active conversations
+  if (upper === "CANCEL" || upper === "STOP") {
     await deactivateActiveConversations(phone);
-    await logSms(null, phone, 'inbound', text, rawPayload);
-    return 'Okay, your booking flow has been cancelled. Text BOOK to start over.';
+    await logSms(null, phone, "inbound", text, rawPayload);
+
+    return "Okay, your booking flow has been cancelled. Text BOOK anytime to start over.";
   }
 
-  // FETCH ACTIVE CONVERSATION
+  // RESET – same as CANCEL, but phrased as “start over”
+  if (upper === "RESET") {
+    await deactivateActiveConversations(phone);
+    await logSms(null, phone, "inbound", text, rawPayload);
+
+    return "Got it. I’ve cleared your previous booking info. Text BOOK to start a fresh reservation.";
+  }
+
+  // SUPPORT – forward to you, confirm to driver
+  if (upper === "SUPPORT") {
+    await logSms(null, phone, "inbound", text, rawPayload);
+
+    const ownerPhone = process.env.ALERT_PHONE_E164;
+
+    if (ownerPhone) {
+      // Fire-and-forget: don’t block user response on this
+      try {
+        await twilioClient.messages.create({
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: ownerPhone,
+          body: `OpenYard SUPPORT from ${phone}: "${text}"`,
+        });
+      } catch (err) {
+        console.error("Error sending support alert:", err);
+      }
+
+      return (
+        "Thanks for reaching out. A human will review your message and follow up if needed.\n" +
+        "You can also text BOOK to start or restart a reservation."
+      );
+    }
+
+    // Fallback if you forget to set ALERT_PHONE_E164
+    return (
+      "Support is not fully configured yet.\n" +
+      "Please email support@openyardpark.com or text BOOK to start a new reservation."
+    );
+  }
+
+  //
+  // ──────────────────────────────
+  //  FETCH ACTIVE CONVERSATION
+  // ──────────────────────────────
+  //
+
   const { data: convRows, error: convErr } = await supabase
-    .from('conversations')
-    .select('*')
-    .eq('driver_phone_e164', phone)
-    .eq('is_active', true)
+    .from("conversations")
+    .select("*")
+    .eq("driver_phone_e164", phone)
+    .eq("is_active", true)
     .limit(1);
 
   if (convErr) {
-    console.error('Error fetching conversation:', convErr);
+    console.error("Error loading conversation:", convErr);
   }
 
   let conversation = convRows && convRows[0] ? convRows[0] : null;
 
-  // START NEW CONVERSATION
-  if (!conversation) {
-    if (upper !== 'BOOK') {
-      await logSms(null, phone, 'inbound', text, rawPayload);
-      return 'Text BOOK to start a new truck parking reservation.';
+  //
+  // ──────────────────────────────
+  //  BOOK – always allowed, even if a convo exists
+  // ──────────────────────────────
+  //
+
+  if (upper === "BOOK") {
+    // If there’s an active conversation, mark it inactive so this is truly “fresh”
+    if (conversation) {
+      await deactivateActiveConversations(phone);
+      conversation = null;
     }
 
+    // Create a brand new conversation
     const { data: newConv, error: newConvErr } = await supabase
-      .from('conversations')
+      .from("conversations")
       .insert({
         driver_phone_e164: phone,
-        current_state: 'awaiting_location_or_lot_code',
+        current_state: "awaiting_location_or_lot_code",
         is_active: true,
         last_inbound_at: new Date().toISOString(),
       })
@@ -139,65 +206,76 @@ async function handleIncomingSms(phone, text, rawPayload) {
       .single();
 
     if (newConvErr) {
-      console.error('Error creating conversation:', newConvErr);
-      return 'We couldn\'t start a booking right now. Try again in a minute.';
+      console.error("Error creating conversation:", newConvErr);
+      return "Something went wrong starting your booking. Please try again in a minute.";
     }
 
     conversation = newConv;
 
-    await logSms(conversation.id, phone, 'inbound', text, rawPayload);
+    await logSms(conversation.id, phone, "inbound", text, rawPayload);
 
     return (
-      'Where do you want to park?\n' +
+      "Where do you want to park?\n" +
       'Reply with a city/exit (e.g. "Bozeman MT") or a lot code.'
     );
   }
 
-  // Log inbound
-  await logSms(conversation.id, phone, 'inbound', text, rawPayload);
+  //
+  // ──────────────────────────────
+  //  NO ACTIVE CONVERSATION & NO BOOK
+  // ──────────────────────────────
+  //
+
+  if (!conversation) {
+    await logSms(null, phone, "inbound", text, rawPayload);
+    return "Text BOOK to start a new truck parking reservation.";
+  }
+
+  //
+  // We *do* have an active conversation – log the SMS and route by state
+  //
+  await logSms(conversation.id, phone, "inbound", text, rawPayload);
 
   const state = conversation.current_state;
 
   switch (state) {
-    case 'awaiting_location_or_lot_code':
+    case "awaiting_location_or_lot_code":
       return handleLocationState(conversation, text);
 
-    case 'awaiting_lot_choice':
+    case "awaiting_lot_choice":
       return handleLotChoiceState(conversation, text);
 
-    case 'awaiting_name':
+    case "awaiting_name":
       return handleNameState(conversation, text);
 
-    case 'awaiting_truck_type':
+    case "awaiting_truck_type":
       return handleTruckTypeState(conversation, text);
 
-    case 'awaiting_make_model':
+    case "awaiting_make_model":
       return handleMakeModelState(conversation, text);
 
-    case 'awaiting_plate':
+    case "awaiting_plate":
       return handlePlateState(conversation, text);
 
-    case 'awaiting_stay_option':
+    case "awaiting_stay_option":
       return handleStayOptionState(conversation, text);
 
-    case 'awaiting_custom_nights':
+    case "awaiting_custom_nights":
       return handleCustomNightsState(conversation, text);
 
-    case 'awaiting_summary_confirmation':
+    case "awaiting_summary_confirmation":
       return handleSummaryConfirmState(conversation, text);
 
-    case 'awaiting_payment':
+    case "awaiting_payment":
       return (
-        'Your payment link was already sent.\n' +
-        'Complete payment to confirm.\n' +
-        'Reply HELP for assistance.'
+        "Your payment link was already sent.\n" +
+        "Complete payment to confirm, or text RESET to start over."
       );
 
     default:
-      return 'Text BOOK to start a new booking.';
+      return "Text BOOK to start a new booking.";
   }
 }
-
 // -----------------------------------------------------
 // Per-State Handlers
 // -----------------------------------------------------
