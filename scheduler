@@ -1,1 +1,162 @@
 
+// scheduler/index.js
+import { supabase, logSms } from '../db/db.js';
+import {
+  twilioClient,
+  notifyOwnerAlert,
+} from '../utils/index.js';
+
+export async function runDueReviewMessages() {
+  const nowIso = new Date().toISOString();
+
+  const { data: due, error: dueErr } = await supabase
+    .from('scheduled_messages')
+    .select('*')
+    .is('sent_at', null)
+    .lte('send_at', nowIso)
+    .limit(10);
+
+  if (dueErr) {
+    console.error('Error fetching scheduled messages:', dueErr);
+    await notifyOwnerAlert(`Error fetching scheduled messages: ${dueErr.message}`);
+    return;
+  }
+
+  if (!due || due.length === 0) return;
+
+  for (const msg of due) {
+    try {
+      const { data: lot, error: lotErr } = await supabase
+        .from('lots')
+        .select('name, region_label, review_url')
+        .eq('id', msg.lot_id)
+        .single();
+
+      if (lotErr) {
+        console.error('Error loading lot for review nudge:', msg.id, lotErr);
+        await notifyOwnerAlert(
+          `Error loading lot for review nudge (msg ${msg.id}): ${lotErr.message}`
+        );
+      }
+
+      const reviewUrl = lot && lot.review_url ? lot.review_url : null;
+
+      if (!reviewUrl) {
+        await supabase
+          .from('scheduled_messages')
+          .update({
+            sent_at: new Date().toISOString(),
+            last_error: 'no review_url on lot',
+          })
+          .eq('id', msg.id);
+        continue;
+      }
+
+      // Fetch booking to get conversation_id and status
+      const { data: bookingRows, error: bookingErr } = await supabase
+        .from('bookings')
+        .select('conversation_id,status')
+        .eq('id', msg.booking_id)
+        .limit(1);
+
+      if (bookingErr || !bookingRows || bookingRows.length === 0) {
+        console.error(
+          'Error loading booking for review nudge:',
+          msg.id,
+          bookingErr
+        );
+        await notifyOwnerAlert(
+          `Error loading booking for review nudge (msg ${msg.id}): ${
+            bookingErr ? bookingErr.message : 'not found'
+          }`
+        );
+        await supabase
+          .from('scheduled_messages')
+          .update({
+            sent_at: new Date().toISOString(),
+            last_error: 'booking not found',
+          })
+          .eq('id', msg.id);
+        continue;
+      }
+
+      const booking = bookingRows[0];
+
+      // Only send review if booking is confirmed
+      if (booking.status !== 'confirmed') {
+        await supabase
+          .from('scheduled_messages')
+          .update({
+            sent_at: new Date().toISOString(),
+            last_error: `skipped: booking status = ${booking.status}`,
+          })
+          .eq('id', msg.id);
+        continue;
+      }
+
+      let firstName = 'driver';
+      if (msg.driver_full_name) {
+        firstName = msg.driver_full_name.trim().split(/\s+/)[0] || 'driver';
+      }
+
+      const lotName = lot ? lot.name : 'OpenYard lot';
+
+      const body =
+        `Hey ${firstName}, thanks for parking with ${lotName} last night! ` +
+        `If you have a second, the lot owner would really appreciate a quick review. ` +
+        `Safe travels! ${reviewUrl}`;
+
+      await twilioClient.messages.create({
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: msg.driver_phone_e164,
+        body,
+      });
+
+      await supabase
+        .from('scheduled_messages')
+        .update({
+          sent_at: new Date().toISOString(),
+          last_error: null,
+        })
+        .eq('id', msg.id);
+
+      await logSms(
+        booking.conversation_id,
+        msg.driver_phone_e164,
+        'outbound',
+        body
+      );
+    } catch (err) {
+      console.error('Error sending scheduled message', msg.id, err);
+      await notifyOwnerAlert(
+        `Error sending scheduled message ${msg.id}: ${err.message}`
+      );
+      await supabase
+        .from('scheduled_messages')
+        .update({
+          last_error: err.message,
+        })
+        .eq('id', msg.id);
+    }
+  }
+}
+
+export async function expireIdleConversations(maxMinutes = 30) {
+  const cutoffIso = new Date(
+    Date.now() - maxMinutes * 60 * 1000
+  ).toISOString();
+
+  const { error } = await supabase
+    .from('conversations')
+    .update({
+      is_active: false,
+      current_state: 'expired',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('is_active', true)
+    .lte('last_inbound_at', cutoffIso);
+
+  if (error) {
+    console.error('Error expiring idle conversations:', error);
+  }
+}
