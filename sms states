@@ -1,1 +1,411 @@
 
+// sms/states/index.js
+import 'dotenv/config';
+import Stripe from 'stripe';
+import { supabase, updateConversation, logSms } from '../../db/db.js';
+import {
+  computePricing,
+  notifyOwnerAlert,
+} from '../../utils/index.js';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2023-10-16',
+});
+
+// Commands footer – used only where needed
+export function withCommandsFooter(mainText) {
+  const commandsBlock =
+    '\n\nCommands:\n' +
+    'BOOK – new booking\n' +
+    'RESET – start over\n' +
+    'SUPPORT – help';
+
+  return mainText + commandsBlock;
+}
+
+export async function handleLocationState(conversation, text) {
+  const raw = text.trim();
+
+  await updateConversation(conversation.id, { location_raw_input: raw });
+
+  // Try slug/lot_code exact match
+  let { data: lots, error: lotsErr } = await supabase
+    .from('lots')
+    .select('*')
+    .eq('is_active', true)
+    .or(
+      `lot_code.ilike.${raw},slug.ilike.${raw.toLowerCase().replace(/\s+/g, '-')}`
+    );
+
+  if (lotsErr) {
+    console.error('Error fetching lots (slug/code):', lotsErr);
+  }
+
+  // If none, try city/state
+  if (!lots || lots.length === 0) {
+    const parts = raw.split(/\s+/);
+    const city = parts[0];
+    const state = parts[1] || null;
+
+    let q = supabase
+      .from('lots')
+      .select('*')
+      .eq('is_active', true)
+      .ilike('city', `${city}%`);
+
+    if (state) q = q.ilike('state', `${state}%`);
+
+    const { data: results, error: cityErr } = await q;
+    if (cityErr) {
+      console.error('Error fetching lots (city/state):', cityErr);
+    }
+    lots = results || [];
+  }
+
+  if (!lots || lots.length === 0) {
+    return (
+      "I couldn't find any lots near that.\n" +
+      'Try a city and state (e.g. "Bozeman MT").'
+    );
+  }
+
+  // SINGLE LOT
+  if (lots.length === 1) {
+    const lot = lots[0];
+
+    await updateConversation(conversation.id, {
+      lot_id: lot.id,
+      current_state: 'awaiting_name',
+    });
+
+    return (
+      `You’re booking: ${lot.name}${
+        lot.region_label ? ' – ' + lot.region_label : ''
+      }.\n\n` + 'What’s your first and last name?'
+    );
+  }
+
+  // MULTIPLE LOTS
+  const limited = lots.slice(0, 5);
+  const lines = limited.map(
+    (lot, i) =>
+      `${i + 1}) ${lot.name}${lot.region_label ? ' – ' + lot.region_label : ''}`
+  );
+
+  await updateConversation(conversation.id, {
+    current_state: 'awaiting_lot_choice',
+  });
+
+  return 'I found these lots:\n' + lines.join('\n') + '\n\nReply with a number.';
+}
+
+export async function handleLotChoiceState(conversation, text) {
+  const n = parseInt(text.trim(), 10);
+  if (Number.isNaN(n) || n < 1) {
+    return 'Reply with a valid number from the list.';
+  }
+
+  const input = conversation.location_raw_input || '';
+  const parts = input.split(/\s+/);
+  const city = parts[0];
+  const state = parts[1] || null;
+
+  let q = supabase
+    .from('lots')
+    .select('*')
+    .eq('is_active', true)
+    .ilike('city', `${city}%`);
+
+  if (state) q = q.ilike('state', `${state}%`);
+
+  const { data: lots, error: lotsErr } = await q;
+  if (lotsErr) {
+    console.error('Error refetching lots for lot choice:', lotsErr);
+  }
+
+  const limited = (lots || []).slice(0, 5);
+  if (n > limited.length) return 'Please choose a valid number.';
+
+  const chosen = limited[n - 1];
+
+  await updateConversation(conversation.id, {
+    lot_id: chosen.id,
+    current_state: 'awaiting_name',
+  });
+
+  return (
+    `You’re booking: ${chosen.name}${
+      chosen.region_label ? ' – ' + chosen.region_label : ''
+    }.\n\n` + 'What’s your first and last name?'
+  );
+}
+
+export async function handleNameState(conversation, text) {
+  const full = text.trim();
+  if (!full || full.length < 2) return 'Please send your full name.';
+
+  await updateConversation(conversation.id, {
+    driver_full_name: full,
+    current_state: 'awaiting_truck_type',
+  });
+
+  return (
+    'What are you parking?\n' +
+    '1 = Semi\n' +
+    '2 = Bobtail\n' +
+    '3 = Hotshot\n' +
+    '4 = Other\n' +
+    'Reply with a number.'
+  );
+}
+
+export async function handleTruckTypeState(conversation, text) {
+  const n = parseInt(text.trim(), 10);
+  const types = {
+    1: 'semi',
+    2: 'bobtail',
+    3: 'hotshot',
+    4: 'other',
+  };
+  const truckType = types[n];
+  if (!truckType) return 'Reply 1, 2, 3, or 4.';
+
+  await updateConversation(conversation.id, {
+    truck_type: truckType,
+    current_state: 'awaiting_make_model',
+  });
+
+  return 'Truck make & model? (e.g. "Freightliner Cascadia")';
+}
+
+export async function handleMakeModelState(conversation, text) {
+  const v = text.trim();
+  if (!v || v.length < 2) return 'Please send truck make & model.';
+
+  await updateConversation(conversation.id, {
+    truck_make_model: v,
+    current_state: 'awaiting_plate',
+  });
+
+  return 'Plate (state + number)? (e.g. "MT 7-XYZ456")';
+}
+
+export async function handlePlateState(conversation, text) {
+  const v = text.trim();
+  if (!v || v.length < 2) return 'Please send a valid license plate.';
+
+  await updateConversation(conversation.id, {
+    license_plate_raw: v,
+    current_state: 'awaiting_stay_option',
+  });
+
+  return (
+    'How long are you staying?\n' +
+    '1 = 1 night\n' +
+    '2 = 7 nights\n' +
+    '3 = 30 nights\n' +
+    '4 = Other\n' +
+    'Reply with a number.'
+  );
+}
+
+export async function handleStayOptionState(conversation, text) {
+  const n = parseInt(text.trim(), 10);
+  if (![1, 2, 3, 4].includes(n)) return 'Reply 1–4.';
+
+  let stayType;
+  let nights;
+
+  if (n === 1) {
+    stayType = 'overnight';
+    nights = 1;
+  } else if (n === 2) {
+    stayType = 'weekly';
+    nights = 7;
+  } else if (n === 3) {
+    stayType = 'monthly';
+    nights = 30;
+  } else {
+    await updateConversation(conversation.id, {
+      current_state: 'awaiting_custom_nights',
+    });
+    return 'How many nights?';
+  }
+
+  await updateConversation(conversation.id, {
+    stay_type: stayType,
+    nights,
+    current_state: 'awaiting_summary_confirmation',
+  });
+
+  return buildSummaryPrompt(conversation.id, stayType, nights);
+}
+
+export async function handleCustomNightsState(conversation, text) {
+  const n = parseInt(text.trim(), 10);
+  if (Number.isNaN(n) || n < 1 || n > 90) return 'Enter 1–90 nights.';
+
+  await updateConversation(conversation.id, {
+    stay_type: 'custom',
+    nights: n,
+    current_state: 'awaiting_summary_confirmation',
+  });
+
+  return buildSummaryPrompt(conversation.id, 'custom', n);
+}
+
+export async function buildSummaryPrompt(conversationId, stayType, nights) {
+  const { data: conv, error: convErr } = await supabase
+    .from('conversations')
+    .select('*')
+    .eq('id', conversationId)
+    .single();
+
+  if (convErr) {
+    console.error('Error loading conversation for summary:', convErr);
+    await notifyOwnerAlert(
+      `Error loading conversation for summary: ${convErr.message}`
+    );
+    return (
+      "We couldn't build your summary. Try again in a moment or text SUPPORT for help."
+    );
+  }
+
+  const { data: lot, error: lotErr } = await supabase
+    .from('lots')
+    .select('*')
+    .eq('id', conv.lot_id)
+    .single();
+
+  if (lotErr) {
+    console.error('Error loading lot for summary:', lotErr);
+    await notifyOwnerAlert(`Error loading lot for summary: ${lotErr.message}`);
+    return (
+      "We couldn't load the lot details. Try again shortly or text SUPPORT for help."
+    );
+  }
+
+  const pricing = computePricing(lot, stayType, nights);
+  const totalDollars = (pricing.total_cents / 100).toFixed(2);
+
+  await updateConversation(conversationId, {
+    quoted_total_cents: pricing.total_cents,
+  });
+
+  return withCommandsFooter(
+    'Here’s your booking:\n' +
+      `• Lot: ${lot.name}${lot.region_label ? ' – ' + lot.region_label : ''}\n` +
+      `• Name: ${conv.driver_full_name}\n` +
+      `• Truck: ${conv.truck_type} – ${conv.truck_make_model}\n` +
+      `• Plate: ${conv.license_plate_raw}\n` +
+      `• Stay: ${nights} night(s)\n` +
+      `• Total: $${totalDollars}\n\n` +
+      'Reply YES to get your payment link, or NO to cancel.'
+  );
+}
+
+export async function handleSummaryConfirmState(conversation, text) {
+  const upper = text.trim().toUpperCase();
+
+  if (upper === 'NO' || upper === 'N') {
+    await updateConversation(conversation.id, {
+      current_state: 'cancelled',
+      is_active: false,
+    });
+    return 'No problem, booking cancelled.';
+  }
+
+  if (!(upper === 'YES' || upper === 'Y')) {
+    return 'Reply YES to get your payment link, or NO to cancel.';
+  }
+
+  // createBooking is handled in payments module; handler will call it.
+  return null;
+}
+
+// Awaiting payment state – handle lost link / re-send
+export async function handleAwaitingPaymentState(conversation, trimmedUpper) {
+  const wantsLink = ['LINK', 'PAY', 'PAYMENT', 'YES', 'Y', 'RESEND'].includes(
+    trimmedUpper
+  );
+
+  if (!wantsLink) {
+    return (
+      'Your payment link was already sent.\n' +
+      'Complete payment to confirm, or text RESET to start over.'
+    );
+  }
+
+  if (!conversation.booking_id) {
+    return (
+      'We tried to find your payment link but ran into an issue.\n' +
+      'Text RESET to start a fresh booking.'
+    );
+  }
+
+  const { data: bookingRows, error: bookingErr } = await supabase
+    .from('bookings')
+    .select('*')
+    .eq('id', conversation.booking_id)
+    .limit(1);
+
+  if (bookingErr || !bookingRows || bookingRows.length === 0) {
+    console.error('Error loading booking in awaiting_payment:', bookingErr);
+    await notifyOwnerAlert(
+      `Error loading booking in awaiting_payment: ${
+        bookingErr ? bookingErr.message : 'not found'
+      }`
+    );
+    return (
+      'We hit a snag trying to find your payment.\n' +
+      'Your card has not been charged. Text RESET to start over.'
+    );
+  }
+
+  const booking = bookingRows[0];
+
+  if (booking.status === 'confirmed') {
+    return (
+      'Your booking is already confirmed and paid.\n' +
+      `Dates: ${booking.start_date} to ${booking.end_date}\n` +
+      `Plate: ${booking.license_plate_raw}`
+    );
+  }
+
+  if (booking.status !== 'pending_payment' || !booking.stripe_session_id) {
+    return (
+      'We could not re-open your payment link.\n' +
+      'Text RESET to start a new booking.'
+    );
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.retrieve(
+      booking.stripe_session_id
+    );
+    if (!session || !session.url) {
+      return (
+        'We could not re-open your payment link.\n' +
+        'Text RESET to start a new booking.'
+      );
+    }
+
+    await logSms(
+      booking.conversation_id,
+      booking.driver_phone_e164,
+      'outbound',
+      session.url
+    );
+
+    return 'Here’s your secure payment link:\n' + session.url;
+  } catch (err) {
+    console.error('Error retrieving Stripe session for resend:', err);
+    await notifyOwnerAlert(
+      `Error retrieving Stripe session for resend: ${err.message}`
+    );
+    return (
+      'We had trouble re-opening your payment link.\n' +
+      'Your card has not been charged. Text RESET to start over.'
+    );
+  }
+}
