@@ -1,4 +1,4 @@
-// server.js – OpenYard SMS Booking Backend (ESM) with next-day 8pm review nudges
+// server.js – OpenYard SMS Booking Backend (ESM) with next-day 8pm review nudges + MENU/SUPPORT commands
 
 import 'dotenv/config';
 import express from 'express';
@@ -56,6 +56,17 @@ app.get('/healthz', async (req, res) => {
 });
 
 // -----------------------------------------------------
+// Small helper to append command footer where useful
+// -----------------------------------------------------
+
+function withCommandsFooter(mainText) {
+  return (
+    mainText +
+    '\n\nCommands: BOOK = new booking · RESET = start over · SUPPORT = help'
+  );
+}
+
+// -----------------------------------------------------
 // Twilio → SMS Handler
 // -----------------------------------------------------
 
@@ -74,8 +85,9 @@ async function twilioWebhookHandler(req, res) {
     replyText = await handleIncomingSms(from, body, req.body);
   } catch (err) {
     console.error('handleIncomingSms error:', err);
-    replyText =
-      'Oops, something went wrong. Try again or text HELP for assistance.';
+    replyText = withCommandsFooter(
+      'Oops, something went wrong. Please try again in a moment or text SUPPORT for help.'
+    );
   }
 
   const twiml = new twilio.twiml.MessagingResponse();
@@ -97,20 +109,44 @@ async function handleIncomingSms(phone, text, rawPayload) {
   // ──────────────────────────────
   //
 
-  // HELP – show menu of hotkeys
+  // DEMO – owner-facing walkthrough of the flow
+  if (upper === 'DEMO') {
+    await logSms(null, phone, 'inbound', text, rawPayload);
+
+    return withCommandsFooter(
+      'OpenYard demo – here’s what your drivers see:\n\n' +
+        '1) They text BOOK to this number.\n' +
+        '2) We ask where they want to park (city/exit or lot code).\n' +
+        '3) They pick your lot, then enter name, truck, plate, and nights.\n' +
+        '4) We text them a secure Stripe payment link to pay by card.\n' +
+        '5) After payment, they get a confirmation + parking instructions.\n' +
+        '6) The next evening, we send them a quick review link for your lot.\n\n' +
+        'If you’d like a live walkthrough, text SUPPORT and we’ll set up a quick demo call.'
+    );
+  }
+
+  // MENU – show list of commands (use this instead of HELP)
+  if (upper === 'MENU') {
+    await logSms(null, phone, 'inbound', text, rawPayload);
+
+    return withCommandsFooter(
+      'OpenYard commands:\n\n' +
+        'BOOK   – start a new reservation\n' +
+        'RESET  – clear your info and start over\n' +
+        'CANCEL – cancel your active booking\n' +
+        'SUPPORT – text a human (8a–8p MT)'
+    );
+  }
+
+  // Twilio still intercepts HELP for compliance, but just in case some provider passes it:
   if (upper === 'HELP') {
     await logSms(null, phone, 'inbound', text, rawPayload);
 
-    return (
-      'OpenYard Truck Parking help:\n' +
-      '\n' +
-      'BOOK   – start a new reservation\n' +
-      'CANCEL – cancel your active booking\n' +
-      'RESET  – clear and start over\n' +
-      'HELP   – show this menu\n' +
-      'SUPPORT – text a human (8a–8p MT)\n' +
-      '\n' +
-      'Reply BOOK to begin a new reservation.'
+    return withCommandsFooter(
+      'For help with OpenYard, you can:\n\n' +
+        'BOOK   – start a new reservation\n' +
+        'RESET  – clear and start over\n' +
+        'SUPPORT – text a human (8a–8p MT)'
     );
   }
 
@@ -119,7 +155,9 @@ async function handleIncomingSms(phone, text, rawPayload) {
     await deactivateActiveConversations(phone);
     await logSms(null, phone, 'inbound', text, rawPayload);
 
-    return 'Okay, your booking flow has been cancelled. Text BOOK anytime to start over.';
+    return withCommandsFooter(
+      'Okay, your booking flow has been cancelled. You will not be charged for any incomplete bookings.'
+    );
   }
 
   // RESET – same as CANCEL, but phrased as “start over”
@@ -127,7 +165,9 @@ async function handleIncomingSms(phone, text, rawPayload) {
     await deactivateActiveConversations(phone);
     await logSms(null, phone, 'inbound', text, rawPayload);
 
-    return 'Got it. I’ve cleared your previous booking info. Text BOOK to start a fresh reservation.';
+    return withCommandsFooter(
+      'Got it. I’ve cleared your previous booking info. Text BOOK to start a fresh reservation.'
+    );
   }
 
   // SUPPORT – forward to you, confirm to driver
@@ -147,16 +187,15 @@ async function handleIncomingSms(phone, text, rawPayload) {
         console.error('Error sending support alert:', err);
       }
 
-      return (
-        'Thanks for reaching out. A human will review your message and follow up if needed.\n' +
-        'You can also text BOOK to start or restart a reservation.'
+      return withCommandsFooter(
+        'Thanks for reaching out. A human will review your message and follow up if needed.'
       );
     }
 
     // Fallback if ALERT_PHONE_E164 not set
-    return (
+    return withCommandsFooter(
       'Support is not fully configured yet.\n' +
-      'Please email support@openyardpark.com or text BOOK to start a new reservation.'
+        'Please email support@openyardpark.com, or text BOOK to start a new reservation.'
     );
   }
 
@@ -204,16 +243,18 @@ async function handleIncomingSms(phone, text, rawPayload) {
 
     if (newConvErr) {
       console.error('Error creating conversation:', newConvErr);
-      return 'Something went wrong starting your booking. Please try again in a minute.';
+      return withCommandsFooter(
+        'Something went wrong starting your booking. Please try again in a minute.'
+      );
     }
 
     conversation = newConv;
 
     await logSms(conversation.id, phone, 'inbound', text, rawPayload);
 
-    return (
+    return withCommandsFooter(
       'Where do you want to park?\n' +
-      'Reply with a city/exit (e.g. "Bozeman MT") or a lot code.'
+        'Reply with a city/exit (e.g. "Bozeman MT") or a lot code.'
     );
   }
 
@@ -225,7 +266,9 @@ async function handleIncomingSms(phone, text, rawPayload) {
 
   if (!conversation) {
     await logSms(null, phone, 'inbound', text, rawPayload);
-    return 'Text BOOK to start a new truck parking reservation.';
+    return withCommandsFooter(
+      'Text BOOK to start a new truck parking reservation.'
+    );
   }
 
   //
@@ -264,13 +307,13 @@ async function handleIncomingSms(phone, text, rawPayload) {
       return handleSummaryConfirmState(conversation, text);
 
     case 'awaiting_payment':
-      return (
+      return withCommandsFooter(
         'Your payment link was already sent.\n' +
-        'Complete payment to confirm, or text RESET to start over.'
+          'Complete payment to confirm, or text RESET to start over.'
       );
 
     default:
-      return 'Text BOOK to start a new booking.';
+      return withCommandsFooter('Text BOOK to start a new booking.');
   }
 }
 
@@ -318,9 +361,9 @@ async function handleLocationState(conversation, text) {
   }
 
   if (!lots || lots.length === 0) {
-    return (
+    return withCommandsFooter(
       "I couldn't find any lots near that.\n" +
-      'Try a city + state (e.g. "Bozeman MT").'
+        'Try a city + state (e.g. "Bozeman MT").'
     );
   }
 
@@ -333,7 +376,7 @@ async function handleLocationState(conversation, text) {
       current_state: 'awaiting_name',
     });
 
-    return (
+    return withCommandsFooter(
       `You’re booking: ${lot.name}${
         lot.region_label ? ' – ' + lot.region_label : ''
       }.\n` + 'What’s your first and last name?'
@@ -351,13 +394,15 @@ async function handleLocationState(conversation, text) {
     current_state: 'awaiting_lot_choice',
   });
 
-  return 'I found these lots:\n' + lines.join('\n') + '\n\nReply with a number.';
+  return withCommandsFooter(
+    'I found these lots:\n' + lines.join('\n') + '\n\nReply with a number.'
+  );
 }
 
 async function handleLotChoiceState(conversation, text) {
   const n = parseInt(text.trim(), 10);
   if (Number.isNaN(n) || n < 1) {
-    return 'Reply with a valid number from the list.';
+    return withCommandsFooter('Reply with a valid number from the list.');
   }
 
   const input = conversation.location_raw_input || '';
@@ -379,7 +424,7 @@ async function handleLotChoiceState(conversation, text) {
   }
 
   const limited = (lots || []).slice(0, 5);
-  if (n > limited.length) return 'Please choose a valid number.';
+  if (n > limited.length) return withCommandsFooter('Please choose a valid number.');
 
   const chosen = limited[n - 1];
 
@@ -388,7 +433,7 @@ async function handleLotChoiceState(conversation, text) {
     current_state: 'awaiting_name',
   });
 
-  return (
+  return withCommandsFooter(
     `You’re booking: ${chosen.name}${
       chosen.region_label ? ' – ' + chosen.region_label : ''
     }.\n` + 'What’s your first and last name?'
@@ -397,20 +442,21 @@ async function handleLotChoiceState(conversation, text) {
 
 async function handleNameState(conversation, text) {
   const full = text.trim();
-  if (!full || full.length < 2) return 'Please send your full name.';
+  if (!full || full.length < 2)
+    return withCommandsFooter('Please send your full name.');
 
   await updateConversation(conversation.id, {
     driver_full_name: full,
     current_state: 'awaiting_truck_type',
   });
 
-  return (
+  return withCommandsFooter(
     'What are you parking?\n' +
-    '1 = Semi\n' +
-    '2 = Bobtail\n' +
-    '3 = Hotshot\n' +
-    '4 = Other\n' +
-    'Reply with a number.'
+      '1 = Semi\n' +
+      '2 = Bobtail\n' +
+      '3 = Hotshot\n' +
+      '4 = Other\n' +
+      'Reply with a number.'
   );
 }
 
@@ -423,50 +469,54 @@ async function handleTruckTypeState(conversation, text) {
     4: 'other',
   };
   const truckType = types[n];
-  if (!truckType) return 'Reply 1, 2, 3, or 4.';
+  if (!truckType)
+    return withCommandsFooter('Reply 1, 2, 3, or 4.');
 
   await updateConversation(conversation.id, {
     truck_type: truckType,
     current_state: 'awaiting_make_model',
   });
 
-  return 'Truck make & model? (e.g. "Freightliner Cascadia")';
+  return withCommandsFooter('Truck make & model? (e.g. "Freightliner Cascadia")');
 }
 
 async function handleMakeModelState(conversation, text) {
   const v = text.trim();
-  if (!v || v.length < 2) return 'Please send truck make & model.';
+  if (!v || v.length < 2)
+    return withCommandsFooter('Please send truck make & model.');
 
   await updateConversation(conversation.id, {
     truck_make_model: v,
     current_state: 'awaiting_plate',
   });
 
-  return 'Plate (state + number)? (e.g. "MT 7-XYZ456")';
+  return withCommandsFooter('Plate (state + number)? (e.g. "MT 7-XYZ456")');
 }
 
 async function handlePlateState(conversation, text) {
   const v = text.trim();
-  if (!v || v.length < 2) return 'Please send a valid license plate.';
+  if (!v || v.length < 2)
+    return withCommandsFooter('Please send a valid license plate.');
 
   await updateConversation(conversation.id, {
     license_plate_raw: v,
     current_state: 'awaiting_stay_option',
   });
 
-  return (
+  return withCommandsFooter(
     'How long are you staying?\n' +
-    '1 = 1 night\n' +
-    '2 = 7 nights\n' +
-    '3 = 30 nights\n' +
-    '4 = Other\n' +
-    'Reply with a number.'
+      '1 = 1 night\n' +
+      '2 = 7 nights\n' +
+      '3 = 30 nights\n' +
+      '4 = Other\n' +
+      'Reply with a number.'
   );
 }
 
 async function handleStayOptionState(conversation, text) {
   const n = parseInt(text.trim(), 10);
-  if (![1, 2, 3, 4].includes(n)) return 'Reply 1–4.';
+  if (![1, 2, 3, 4].includes(n))
+    return withCommandsFooter('Reply 1–4.');
 
   let stayType;
   let nights;
@@ -484,7 +534,7 @@ async function handleStayOptionState(conversation, text) {
     await updateConversation(conversation.id, {
       current_state: 'awaiting_custom_nights',
     });
-    return 'How many nights?';
+    return withCommandsFooter('How many nights?');
   }
 
   await updateConversation(conversation.id, {
@@ -498,7 +548,8 @@ async function handleStayOptionState(conversation, text) {
 
 async function handleCustomNightsState(conversation, text) {
   const n = parseInt(text.trim(), 10);
-  if (Number.isNaN(n) || n < 1 || n > 90) return 'Enter 1–90 nights.';
+  if (Number.isNaN(n) || n < 1 || n > 90)
+    return withCommandsFooter('Enter 1–90 nights.');
 
   await updateConversation(conversation.id, {
     stay_type: 'custom',
@@ -518,7 +569,9 @@ async function buildSummaryPrompt(conversationId, stayType, nights) {
 
   if (convErr) {
     console.error('Error loading conversation for summary:', convErr);
-    return "We couldn't build your summary. Try again in a moment.";
+    return withCommandsFooter(
+      "We couldn't build your summary. Try again in a moment or text SUPPORT for help."
+    );
   }
 
   const { data: lot, error: lotErr } = await supabase
@@ -529,7 +582,9 @@ async function buildSummaryPrompt(conversationId, stayType, nights) {
 
   if (lotErr) {
     console.error('Error loading lot for summary:', lotErr);
-    return "We couldn't load the lot details. Try again shortly.";
+    return withCommandsFooter(
+      "We couldn't load the lot details. Try again shortly or text SUPPORT for help."
+    );
   }
 
   const pricing = computePricing(lot, stayType, nights);
@@ -539,15 +594,15 @@ async function buildSummaryPrompt(conversationId, stayType, nights) {
     quoted_total_cents: pricing.total_cents,
   });
 
-  return (
+  return withCommandsFooter(
     'Here’s your booking:\n' +
-    `• Lot: ${lot.name}${lot.region_label ? ' – ' + lot.region_label : ''}\n` +
-    `• Name: ${conv.driver_full_name}\n` +
-    `• Truck: ${conv.truck_type} – ${conv.truck_make_model}\n` +
-    `• Plate: ${conv.license_plate_raw}\n` +
-    `• Stay: ${nights} night(s)\n` +
-    `• Total: $${totalDollars}\n\n` +
-    'Reply YES to get your payment link, or NO to cancel.'
+      `• Lot: ${lot.name}${lot.region_label ? ' – ' + lot.region_label : ''}\n` +
+      `• Name: ${conv.driver_full_name}\n` +
+      `• Truck: ${conv.truck_type} – ${conv.truck_make_model}\n` +
+      `• Plate: ${conv.license_plate_raw}\n` +
+      `• Stay: ${nights} night(s)\n` +
+      `• Total: $${totalDollars}\n\n` +
+      'Reply YES to get your payment link, or NO to cancel.'
   );
 }
 
@@ -559,11 +614,13 @@ async function handleSummaryConfirmState(conversation, text) {
       current_state: 'cancelled',
       is_active: false,
     });
-    return 'No problem, booking cancelled.';
+    return withCommandsFooter('No problem, booking cancelled.');
   }
 
   if (!(upper === 'YES' || upper === 'Y')) {
-    return 'Reply YES to get your payment link, or NO to cancel.';
+    return withCommandsFooter(
+      'Reply YES to get your payment link, or NO to cancel.'
+    );
   }
 
   return createBooking(conversation);
@@ -582,7 +639,9 @@ async function createBooking(conversation) {
 
   if (convErr) {
     console.error('Error reloading conversation for booking:', convErr);
-    return "We couldn't create your booking. Please try again.";
+    return withCommandsFooter(
+      "We couldn't create your booking. Please try again."
+    );
   }
 
   const { data: lot, error: lotErr } = await supabase
@@ -593,7 +652,9 @@ async function createBooking(conversation) {
 
   if (lotErr) {
     console.error('Error loading lot for booking:', lotErr);
-    return "We couldn't find that lot. Try again.";
+    return withCommandsFooter(
+      "We couldn't find that lot. Try again."
+    );
   }
 
   const pricing = computePricing(lot, conv.stay_type, conv.nights);
@@ -632,7 +693,9 @@ async function createBooking(conversation) {
 
   if (bookingErr) {
     console.error('Supabase insert booking error:', bookingErr);
-    return "We couldn't create your booking. Please try again.";
+    return withCommandsFooter(
+      "We couldn't create your booking. Please try again."
+    );
   }
 
   const session = await stripe.checkout.sessions.create({
@@ -675,7 +738,7 @@ async function createBooking(conversation) {
 
   await logSms(conv.id, conv.driver_phone_e164, 'outbound', session.url);
 
-  return 'Here’s your secure payment link:\n' + session.url;
+  return withCommandsFooter('Here’s your secure payment link:\n' + session.url);
 }
 
 // -----------------------------------------------------
@@ -829,10 +892,9 @@ async function stripeWebhookHandler(req, res) {
 function computeReviewSendAt(lot) {
   const lotTz = (lot && lot.time_zone) || 'America/Denver';
 
-  // Now in lot's local time
+  // Next calendar day at 20:00 local time
   const nowLot = DateTime.now().setZone(lotTz);
 
-  // Next calendar day at 20:00 local
   const nextDay8pmLot = nowLot
     .plus({ days: 1 })
     .startOf('day')
