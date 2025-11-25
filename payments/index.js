@@ -80,6 +80,16 @@ export async function createBooking(conversation) {
     return "We couldn't create your booking. Please try again.";
   }
 
+  const successUrl =
+    process.env.CHECKOUT_SUCCESS_URL || 'https://openyardpark.com';
+  const cancelUrl =
+    process.env.CHECKOUT_CANCEL_URL || 'https://openyardpark.com';
+
+  console.log('Creating Stripe session with URLs:', {
+    successUrl,
+    cancelUrl,
+  });
+
   const session = await stripe.checkout.sessions.create({
     mode: 'payment',
     payment_method_types: ['card'],
@@ -99,10 +109,8 @@ export async function createBooking(conversation) {
     metadata: {
       booking_id: booking.id,
     },
-    success_url:
-      process.env.CHECKOUT_SUCCESS_URL || 'https://openyardpark.com/success',
-    cancel_url:
-      process.env.CHECKOUT_CANCEL_URL || 'https://openyardpark.com/cancel',
+    success_url: successUrl,
+    cancel_url: cancelUrl,
   });
 
   await supabase
