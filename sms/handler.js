@@ -181,10 +181,11 @@ async function handleIncomingSms(phone, text, rawPayload) {
 
     await logSms(conversation.id, phone, 'inbound', text, rawPayload);
 
-    // FIRST MESSAGE → include commands footer
+    // FIRST MESSAGE → include commands footer + STOP compliance line
     return withCommandsFooter(
       'Where do you want to park?\n' +
-        'Reply with a city and state (e.g. "Bozeman MT").'
+        'Reply with a city and state (e.g. "Bozeman MT").\n\n' +
+        'Msg & data rates may apply. Reply STOP to opt out.'
     );
   }
 
