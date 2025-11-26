@@ -137,7 +137,7 @@ async function handleIncomingSms(phone, text, rawPayload) {
     );
   }
 
-  // Load active conversation
+  // Load active conversation (if any)
   const { data: convRows, error: convErr } = await supabase
     .from('conversations')
     .select('*')
@@ -151,7 +151,23 @@ async function handleIncomingSms(phone, text, rawPayload) {
 
   let conversation = convRows && convRows[0] ? convRows[0] : null;
 
-  // BOOK – always allowed
+  // 🔒 AUTO-EXPIRE after 30 minutes of inactivity
+  if (conversation && conversation.last_inbound_at) {
+    try {
+      const last = new Date(conversation.last_inbound_at).getTime();
+      const now = Date.now();
+      const THIRTY_MIN_MS = 30 * 60 * 1000;
+
+      if (now - last > THIRTY_MIN_MS) {
+        await deactivateActiveConversations(phone);
+        conversation = null;
+      }
+    } catch (err) {
+      console.error('Error checking idle expiry:', err);
+    }
+  }
+
+  // BOOK – always allowed (even if there WAS a previous convo)
   if (upper === 'BOOK') {
     if (conversation) {
       await deactivateActiveConversations(phone);
