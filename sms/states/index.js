@@ -8,7 +8,6 @@ export function withCommandsFooter(mainText) {
   const commandsBlock =
     '\n\nCommands:\n' +
     'BOOK = new booking\n' +
-    'RESET = start over\n' +
     'SUPPORT = help';
 
   return mainText + commandsBlock;
