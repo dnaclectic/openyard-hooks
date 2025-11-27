@@ -20,7 +20,7 @@ import {
   handleSummaryConfirmState,
   handleAwaitingPaymentState,
 } from './states/index.js';
-import { createBooking } from '../payments/index.js';
+import { createBooking, handleEmailForReceipt } from '../payments/index.js';
 
 export async function twilioWebhookHandler(req, res) {
   const from = req.body.From;
@@ -53,6 +53,15 @@ export async function twilioWebhookHandler(req, res) {
   twiml.message(replyText);
 
   res.type('text/xml').send(twiml.toString());
+}
+
+function looksLikeEmail(text) {
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (!trimmed.includes('@')) return false;
+  // simple but effective email pattern
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(trimmed);
 }
 
 async function handleIncomingSms(phone, text, rawPayload) {
@@ -137,6 +146,12 @@ async function handleIncomingSms(phone, text, rawPayload) {
     );
   }
 
+  // EMAIL FOR RECEIPT – must come before normal convo handling
+  if (looksLikeEmail(text)) {
+    await logSms(null, phone, 'inbound', text, rawPayload);
+    return await handleEmailForReceipt(phone, text);
+  }
+
   // Load active conversation (if any)
   const { data: convRows, error: convErr } = await supabase
     .from('conversations')
@@ -151,7 +166,7 @@ async function handleIncomingSms(phone, text, rawPayload) {
 
   let conversation = convRows && convRows[0] ? convRows[0] : null;
 
-  // 🔒 AUTO-EXPIRE after 30 minutes of inactivity
+  // AUTO-EXPIRE after 30 minutes of inactivity
   if (conversation && conversation.last_inbound_at) {
     try {
       const last = new Date(conversation.last_inbound_at).getTime();
