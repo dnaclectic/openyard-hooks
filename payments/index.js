@@ -80,16 +80,6 @@ export async function createBooking(conversation) {
     return "We couldn't create your booking. Please try again.";
   }
 
-  const successUrl =
-    process.env.CHECKOUT_SUCCESS_URL || 'https://openyardpark.com';
-  const cancelUrl =
-    process.env.CHECKOUT_CANCEL_URL || 'https://openyardpark.com';
-
-  console.log('Creating Stripe session with URLs:', {
-    successUrl,
-    cancelUrl,
-  });
-
   const session = await stripe.checkout.sessions.create({
     mode: 'payment',
     payment_method_types: ['card'],
@@ -109,8 +99,10 @@ export async function createBooking(conversation) {
     metadata: {
       booking_id: booking.id,
     },
-    success_url: successUrl,
-    cancel_url: cancelUrl,
+    success_url:
+      process.env.CHECKOUT_SUCCESS_URL || 'https://openyardpark.com',
+    cancel_url:
+      process.env.CHECKOUT_CANCEL_URL || 'https://openyardpark.com',
   });
 
   await supabase
@@ -220,7 +212,8 @@ export async function stripeWebhookHandler(req, res) {
       `Dates: ${booking.start_date} to ${booking.end_date}\n` +
       `Plate: ${booking.license_plate_raw}\n\n` +
       `Instructions:\n${instructions}\n\n` +
-      'Keep this text as your receipt.';
+      'Keep this text as your receipt.\n' +
+      'Want an email receipt too? Reply with your email address.';
 
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER,
@@ -249,4 +242,71 @@ export async function stripeWebhookHandler(req, res) {
   }
 
   res.send('ok');
+}
+
+/**
+ * Handle a driver texting an email address to get a receipt.
+ * We find their most recent confirmed booking and attach the email
+ * to the underlying Stripe PaymentIntent so Stripe emails a receipt.
+ */
+export async function handleEmailForReceipt(phone, emailRaw) {
+  const email = emailRaw.trim();
+
+  const { data: bookingRows, error } = await supabase
+    .from('bookings')
+    .select('*')
+    .eq('driver_phone_e164', phone)
+    .eq('status', 'confirmed')
+    .order('paid_at', { ascending: false })
+    .limit(1);
+
+  if (error || !bookingRows || bookingRows.length === 0) {
+    console.error('No confirmed booking found for email receipt:', error);
+    await notifyOwnerAlert(
+      `No confirmed booking found for email receipt for ${phone}`
+    );
+    return (
+      "I couldn't find a recent confirmed booking to attach that email to.\n" +
+      'If you just booked and this keeps happening, text SUPPORT.'
+    );
+  }
+
+  const booking = bookingRows[0];
+
+  // Optional: store email in bookings table if you add a column later
+  try {
+    await supabase
+      .from('bookings')
+      .update({
+        receipt_email: email,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', booking.id);
+  } catch (err) {
+    console.error('Error saving receipt_email on booking:', err);
+  }
+
+  // Ask Stripe to email a receipt for this payment
+  try {
+    if (booking.stripe_payment_intent_id) {
+      await stripe.paymentIntents.update(booking.stripe_payment_intent_id, {
+        receipt_email: email,
+      });
+    } else {
+      console.warn(
+        'No stripe_payment_intent_id on booking when handling email receipt.'
+      );
+    }
+  } catch (err) {
+    console.error('Error updating PaymentIntent receipt_email:', err);
+    await notifyOwnerAlert(
+      `Error setting receipt_email on PI for booking ${booking.id}: ${err.message}`
+    );
+    return (
+      `I saved ${email} but had trouble sending the receipt automatically.\n` +
+      'If you do not receive it, email alex@openyardpark.com.'
+    );
+  }
+
+  return `Got it. We’ll email a Stripe receipt to ${email} shortly.`;
 }
