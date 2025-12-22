@@ -1,3 +1,4 @@
+// payments/index.js
 import "dotenv/config";
 import Stripe from "stripe";
 import { supabase, logSms, updateConversation } from "../db/db.js";
@@ -13,30 +14,121 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 function buildLotAddress(lot) {
-  const line1 = lot.address_line1 || "";
-  const line2 = lot.address_line2 || "";
-  const city = lot.city || "";
-  const state = lot.state || "";
-  const zip = lot.zip || "";
+  const line1 = (lot.address_line1 || "").trim();
+  const line2 = (lot.address_line2 || "").trim();
+  const city = (lot.city || "").trim();
+  const state = (lot.state || "").trim();
+  const zip = (lot.zip || "").trim();
 
   const street = [line1, line2].filter(Boolean).join(", ");
   const cityStateZip = [city, state, zip].filter(Boolean).join(" ");
-  return [street, cityStateZip].filter(Boolean).join(", ");
+  return [street, cityStateZip].filter(Boolean).join(", ").trim();
 }
 
-function buildGoogleMapsUrl(lot) {
-  const address = buildLotAddress(lot);
+function hasMeaningfulAddress(address) {
+  // Prevent sending vague stuff like "Frontage Rd, Bozeman MT 59715" if you consider that too weak.
+  // If you want to allow any address_line1, just return Boolean(address).
+  if (!address) return false;
+  const a = address.toLowerCase();
+  // heuristic: must contain a number OR a comma-separated street+city
+  const hasNumber = /\d/.test(a);
+  const hasComma = a.includes(",");
+  return hasNumber || hasComma;
+}
 
-  // Prefer address; fallback to lat/long; last resort: lot name / lot code
-  const query =
-    address ||
-    (lot.latitude != null && lot.longitude != null
-      ? `${lot.latitude},${lot.longitude}`
-      : lot.name || lot.lot_code || "OpenYard lot");
-
+function buildGoogleMapsUrlFromQuery(query) {
   return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
     query
   )}`;
+}
+
+function buildNavigateLink(lot) {
+  // Prefer GPS coordinates for truckers (less ambiguity)
+  const hasGps =
+    lot &&
+    lot.latitude != null &&
+    lot.longitude != null &&
+    Number.isFinite(Number(lot.latitude)) &&
+    Number.isFinite(Number(lot.longitude));
+
+  if (hasGps) {
+    const lat = Number(lot.latitude);
+    const lng = Number(lot.longitude);
+    const gps = `${lat},${lng}`;
+    return {
+      gpsLine: `${lat}, ${lng}`,
+      url: buildGoogleMapsUrlFromQuery(gps),
+      used: "gps",
+    };
+  }
+
+  const address = buildLotAddress(lot);
+  if (address && hasMeaningfulAddress(address)) {
+    return {
+      gpsLine: "",
+      url: buildGoogleMapsUrlFromQuery(address),
+      used: "address",
+    };
+  }
+
+  // last resort
+  const fallback = lot?.name || lot?.lot_code || "OpenYard lot";
+  return {
+    gpsLine: "",
+    url: buildGoogleMapsUrlFromQuery(fallback),
+    used: "name",
+  };
+}
+
+function formatDateRange(startDate, endDate) {
+  return `${startDate} to ${endDate}`;
+}
+
+function templatePaymentLink({ lotName, lotCode, nights, totalCents, url }) {
+  const dollars = Math.round(Number(totalCents) / 100);
+  const lotLine = `${lotName}${lotCode ? ` (${lotCode})` : ""}`;
+
+  return (
+    "OpenYard — secure payment link\n" +
+    `${lotLine}\n` +
+    `${nights} night${nights === 1 ? "" : "s"} • $${dollars}\n\n` +
+    `${url}\n\n` +
+    "Need help? Reply SUPPORT."
+  );
+}
+
+function templateConfirmation({
+  lotName,
+  lotCode,
+  datesLine,
+  plate,
+  addressLine,
+  navigateUrl,
+  gpsLine,
+  instructions,
+}) {
+  // Keep it clean + scannable for SMS
+  const lines = [];
+
+  lines.push("✅ Booking confirmed!");
+  lines.push(`${lotName}${lotCode ? ` (${lotCode})` : ""}`);
+  lines.push(`Dates: ${datesLine}`);
+  if (plate) lines.push(`Plate: ${plate}`);
+  lines.push("");
+
+  if (addressLine) lines.push(`Address: ${addressLine}`);
+  lines.push(`Navigate: ${navigateUrl}`);
+  if (gpsLine) lines.push(`GPS: ${gpsLine}`);
+  lines.push("");
+
+  lines.push("Special instructions:");
+  lines.push(instructions || "Park in marked truck stalls.");
+  lines.push("");
+
+  lines.push("Keep this text for your records.");
+  lines.push("Reply SUPPORT if you need help.");
+
+  return lines.join("\n");
 }
 
 export async function createBooking(conversation) {
@@ -144,9 +236,17 @@ export async function createBooking(conversation) {
     current_state: "awaiting_payment",
   });
 
-  await logSms(conv.id, conv.driver_phone_e164, "outbound", session.url);
+  const payMsg = templatePaymentLink({
+    lotName: lot?.name || "OpenYard lot",
+    lotCode: lot?.lot_code || "",
+    nights: Number(conv.nights || 1),
+    totalCents: pricing.total_cents,
+    url: session.url,
+  });
 
-  return "Here’s your secure payment link:\n" + session.url;
+  await logSms(conv.id, conv.driver_phone_e164, "outbound", payMsg);
+
+  return payMsg;
 }
 
 export async function stripeWebhookHandler(req, res) {
@@ -226,31 +326,30 @@ export async function stripeWebhookHandler(req, res) {
     }
 
     const lotName = lot?.name || "OpenYard lot";
-    const lotCode = lot?.lot_code ? ` (${lot.lot_code})` : "";
-    const address = lot ? buildLotAddress(lot) : "";
-    const mapsUrl = lot ? buildGoogleMapsUrl(lot) : "";
-    const hasGps = lot?.latitude != null && lot?.longitude != null;
-    const gpsLine = hasGps ? `${lot.latitude}, ${lot.longitude}` : "";
+    const lotCode = lot?.lot_code || "";
+    const addressRaw = lot ? buildLotAddress(lot) : "";
+    const addressLine =
+      addressRaw && hasMeaningfulAddress(addressRaw) ? addressRaw : "";
+
+    const nav = lot ? buildNavigateLink(lot) : { url: "", gpsLine: "", used: "name" };
+    const navigateUrl = nav.url || "https://www.google.com/maps";
+    const gpsLine = nav.gpsLine || "";
 
     const instructions =
       lot && lot.parking_instructions
         ? lot.parking_instructions
         : "Park in marked truck stalls.";
 
-    // UPDATED CONFIRMATION MESSAGE (no email receipt prompt)
-    const confirmMsg =
-      "✅ Booking confirmed!\n" +
-      `${lotName}${lotCode}\n` +
-      `Dates: ${booking.start_date} to ${booking.end_date}\n` +
-      (booking.license_plate_raw ? `Plate: ${booking.license_plate_raw}\n` : "") +
-      "\n" +
-      (address ? `Address: ${address}\n` : "") +
-      (mapsUrl ? `Navigate: ${mapsUrl}\n` : "") +
-      (gpsLine ? `GPS: ${gpsLine}\n` : "") +
-      "\n" +
-      "Special instructions:\n" +
-      `${instructions}\n\n` +
-      "Keep this text for your records. Reply SUPPORT if you need help.";
+    const confirmMsg = templateConfirmation({
+      lotName,
+      lotCode,
+      datesLine: formatDateRange(booking.start_date, booking.end_date),
+      plate: booking.license_plate_raw || "",
+      addressLine,
+      navigateUrl,
+      gpsLine,
+      instructions,
+    });
 
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER,
