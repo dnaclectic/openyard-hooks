@@ -1,20 +1,48 @@
 // scheduler/index.js
-import { supabase, logSms } from '../db/db.js';
-import { twilioClient, notifyOwnerAlert } from '../utils/index.js';
+import { supabase, logSms } from "../db/db.js";
+import { twilioClient, notifyOwnerAlert } from "../utils/index.js";
+
+function buildLotAddress(lot) {
+  const line1 = lot.address_line1 || "";
+  const line2 = lot.address_line2 || "";
+  const city = lot.city || "";
+  const state = lot.state || "";
+  const zip = lot.zip || "";
+
+  const street = [line1, line2].filter(Boolean).join(", ");
+  const cityStateZip = [city, state, zip].filter(Boolean).join(" ");
+  return [street, cityStateZip].filter(Boolean).join(", ");
+}
+
+function buildGoogleMapsUrl(lot) {
+  const address = buildLotAddress(lot);
+
+  const query =
+    address ||
+    (lot.latitude != null && lot.longitude != null
+      ? `${lot.latitude},${lot.longitude}`
+      : lot.name || lot.lot_code || "OpenYard lot");
+
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+    query
+  )}`;
+}
 
 export async function runDueReviewMessages() {
   const nowIso = new Date().toISOString();
 
   const { data: due, error: dueErr } = await supabase
-    .from('scheduled_messages')
-    .select('*')
-    .is('sent_at', null)
-    .lte('send_at', nowIso)
+    .from("scheduled_messages")
+    .select("*")
+    .is("sent_at", null)
+    .lte("send_at", nowIso)
     .limit(10);
 
   if (dueErr) {
-    console.error('Error fetching scheduled messages:', dueErr);
-    await notifyOwnerAlert(`Error fetching scheduled messages: ${dueErr.message}`);
+    console.error("Error fetching scheduled messages:", dueErr);
+    await notifyOwnerAlert(
+      `Error fetching scheduled messages: ${dueErr.message}`
+    );
     return;
   }
 
@@ -23,13 +51,15 @@ export async function runDueReviewMessages() {
   for (const msg of due) {
     try {
       const { data: lot, error: lotErr } = await supabase
-        .from('lots')
-        .select('name, region_label, review_url')
-        .eq('id', msg.lot_id)
+        .from("lots")
+        .select(
+          "name, lot_code, region_label, review_url, address_line1, address_line2, city, state, zip, latitude, longitude"
+        )
+        .eq("id", msg.lot_id)
         .single();
 
       if (lotErr) {
-        console.error('Error loading lot for review nudge:', msg.id, lotErr);
+        console.error("Error loading lot for review nudge:", msg.id, lotErr);
         await notifyOwnerAlert(
           `Error loading lot for review nudge (msg ${msg.id}): ${lotErr.message}`
         );
@@ -39,64 +69,68 @@ export async function runDueReviewMessages() {
 
       if (!reviewUrl) {
         await supabase
-          .from('scheduled_messages')
+          .from("scheduled_messages")
           .update({
             sent_at: new Date().toISOString(),
-            last_error: 'no review_url on lot',
+            last_error: "no review_url on lot",
           })
-          .eq('id', msg.id);
+          .eq("id", msg.id);
         continue;
       }
 
       // Fetch booking to get conversation_id and status
       const { data: bookingRows, error: bookingErr } = await supabase
-        .from('bookings')
-        .select('conversation_id,status')
-        .eq('id', msg.booking_id)
+        .from("bookings")
+        .select("conversation_id,status")
+        .eq("id", msg.booking_id)
         .limit(1);
 
       if (bookingErr || !bookingRows || bookingRows.length === 0) {
-        console.error('Error loading booking for review nudge:', msg.id, bookingErr);
+        console.error("Error loading booking for review nudge:", msg.id, bookingErr);
         await notifyOwnerAlert(
           `Error loading booking for review nudge (msg ${msg.id}): ${
-            bookingErr ? bookingErr.message : 'not found'
+            bookingErr ? bookingErr.message : "not found"
           }`
         );
         await supabase
-          .from('scheduled_messages')
+          .from("scheduled_messages")
           .update({
             sent_at: new Date().toISOString(),
-            last_error: 'booking not found',
+            last_error: "booking not found",
           })
-          .eq('id', msg.id);
+          .eq("id", msg.id);
         continue;
       }
 
       const booking = bookingRows[0];
 
       // Only send review if booking is confirmed
-      if (booking.status !== 'confirmed') {
+      if (booking.status !== "confirmed") {
         await supabase
-          .from('scheduled_messages')
+          .from("scheduled_messages")
           .update({
             sent_at: new Date().toISOString(),
             last_error: `skipped: booking status = ${booking.status}`,
           })
-          .eq('id', msg.id);
+          .eq("id", msg.id);
         continue;
       }
 
-      let firstName = 'driver';
+      let firstName = "driver";
       if (msg.driver_full_name) {
-        firstName = msg.driver_full_name.trim().split(/\s+/)[0] || 'driver';
+        firstName = msg.driver_full_name.trim().split(/\s+/)[0] || "driver";
       }
 
-      const lotName = lot ? lot.name : 'OpenYard lot';
+      const lotName = lot?.name || "OpenYard lot";
+      const lotCode = lot?.lot_code ? ` (${lot.lot_code})` : "";
+      const mapsUrl = lot ? buildGoogleMapsUrl(lot) : "";
 
       const body =
-        `Hey ${firstName}, thanks for parking with ${lotName} last night! ` +
-        `If you have a second, the lot owner would really appreciate a quick review. ` +
-        `Safe travels! ${reviewUrl}`;
+        `Hey ${firstName} — quick favor? ` +
+        `If you have 15 seconds, please leave a review for ${lotName}${lotCode}. ` +
+        (mapsUrl ? `Maps: ${mapsUrl} ` : "") +
+        `Review: ${reviewUrl} ` +
+        `Safe travels.`;
 
       await twilioClient.messages.create({
         from: process.env.TWILIO_PHONE_NUMBER,
@@ -105,30 +139,25 @@ export async function runDueReviewMessages() {
       });
 
       await supabase
-        .from('scheduled_messages')
+        .from("scheduled_messages")
         .update({
           sent_at: new Date().toISOString(),
           last_error: null,
         })
-        .eq('id', msg.id);
+        .eq("id", msg.id);
 
-      await logSms(
-        booking.conversation_id,
-        msg.driver_phone_e164,
-        'outbound',
-        body
-      );
+      await logSms(booking.conversation_id, msg.driver_phone_e164, "outbound", body);
     } catch (err) {
-      console.error('Error sending scheduled message', msg.id, err);
+      console.error("Error sending scheduled message", msg.id, err);
       await notifyOwnerAlert(
         `Error sending scheduled message ${msg.id}: ${err.message}`
       );
       await supabase
-        .from('scheduled_messages')
+        .from("scheduled_messages")
         .update({
           last_error: err.message,
         })
-        .eq('id', msg.id);
+        .eq("id", msg.id);
     }
   }
 }
@@ -137,16 +166,16 @@ export async function expireIdleConversations(maxMinutes = 30) {
   const cutoffIso = new Date(Date.now() - maxMinutes * 60 * 1000).toISOString();
 
   const { error } = await supabase
-    .from('conversations')
+    .from("conversations")
     .update({
       is_active: false,
-      current_state: 'expired',
+      current_state: "expired",
       updated_at: new Date().toISOString(),
     })
-    .eq('is_active', true)
-    .lte('last_inbound_at', cutoffIso);
+    .eq("is_active", true)
+    .lte("last_inbound_at", cutoffIso);
 
   if (error) {
-    console.error('Error expiring idle conversations:', error);
+    console.error("Error expiring idle conversations:", error);
   }
 }
