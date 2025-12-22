@@ -1,31 +1,66 @@
-// scheduler/index.js
 import { supabase, logSms } from "../db/db.js";
 import { twilioClient, notifyOwnerAlert } from "../utils/index.js";
 
 function buildLotAddress(lot) {
-  const line1 = lot.address_line1 || "";
-  const line2 = lot.address_line2 || "";
-  const city = lot.city || "";
-  const state = lot.state || "";
-  const zip = lot.zip || "";
+  const line1 = (lot.address_line1 || "").trim();
+  const line2 = (lot.address_line2 || "").trim();
+  const city = (lot.city || "").trim();
+  const state = (lot.state || "").trim();
+  const zip = (lot.zip || "").trim();
 
   const street = [line1, line2].filter(Boolean).join(", ");
   const cityStateZip = [city, state, zip].filter(Boolean).join(" ");
-  return [street, cityStateZip].filter(Boolean).join(", ");
+  return [street, cityStateZip].filter(Boolean).join(", ").trim();
 }
 
-function buildGoogleMapsUrl(lot) {
-  const address = buildLotAddress(lot);
+function hasMeaningfulAddress(address) {
+  if (!address) return false;
+  const a = address.toLowerCase();
+  const hasNumber = /\d/.test(a);
+  const hasComma = a.includes(",");
+  return hasNumber || hasComma;
+}
 
-  const query =
-    address ||
-    (lot.latitude != null && lot.longitude != null
-      ? `${lot.latitude},${lot.longitude}`
-      : lot.name || lot.lot_code || "OpenYard lot");
-
+function buildGoogleMapsUrlFromQuery(query) {
   return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
     query
   )}`;
+}
+
+function buildNavigateLink(lot) {
+  const hasGps =
+    lot &&
+    lot.latitude != null &&
+    lot.longitude != null &&
+    Number.isFinite(Number(lot.latitude)) &&
+    Number.isFinite(Number(lot.longitude));
+
+  if (hasGps) {
+    const lat = Number(lot.latitude);
+    const lng = Number(lot.longitude);
+    const gps = `${lat},${lng}`;
+    return {
+      gpsLine: `${lat}, ${lng}`,
+      url: buildGoogleMapsUrlFromQuery(gps),
+      used: "gps",
+    };
+  }
+
+  const address = buildLotAddress(lot);
+  if (address && hasMeaningfulAddress(address)) {
+    return {
+      gpsLine: "",
+      url: buildGoogleMapsUrlFromQuery(address),
+      used: "address",
+    };
+  }
+
+  const fallback = lot?.name || lot?.lot_code || "OpenYard lot";
+  return {
+    gpsLine: "",
+    url: buildGoogleMapsUrlFromQuery(fallback),
+    used: "name",
+  };
 }
 
 export async function runDueReviewMessages() {
@@ -86,7 +121,11 @@ export async function runDueReviewMessages() {
         .limit(1);
 
       if (bookingErr || !bookingRows || bookingRows.length === 0) {
-        console.error("Error loading booking for review nudge:", msg.id, bookingErr);
+        console.error(
+          "Error loading booking for review nudge:",
+          msg.id,
+          bookingErr
+        );
         await notifyOwnerAlert(
           `Error loading booking for review nudge (msg ${msg.id}): ${
             bookingErr ? bookingErr.message : "not found"
@@ -123,12 +162,15 @@ export async function runDueReviewMessages() {
 
       const lotName = lot?.name || "OpenYard lot";
       const lotCode = lot?.lot_code ? ` (${lot.lot_code})` : "";
-      const mapsUrl = lot ? buildGoogleMapsUrl(lot) : "";
 
+      const nav = lot ? buildNavigateLink(lot) : { url: "", gpsLine: "", used: "name" };
+      const navigateUrl = nav.url || "";
+
+      // Keep it short (review requests should be tight)
       const body =
         `Hey ${firstName} — quick favor? ` +
         `If you have 15 seconds, please leave a review for ${lotName}${lotCode}. ` +
-        (mapsUrl ? `Maps: ${mapsUrl} ` : "") +
+        (navigateUrl ? `Navigate: ${navigateUrl} ` : "") +
         `Review: ${reviewUrl} ` +
         `Safe travels.`;
 
@@ -146,7 +188,12 @@ export async function runDueReviewMessages() {
         })
         .eq("id", msg.id);
 
-      await logSms(booking.conversation_id, msg.driver_phone_e164, "outbound", body);
+      await logSms(
+        booking.conversation_id,
+        msg.driver_phone_e164,
+        "outbound",
+        body
+      );
     } catch (err) {
       console.error("Error sending scheduled message", msg.id, err);
       await notifyOwnerAlert(
