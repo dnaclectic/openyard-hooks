@@ -14,21 +14,27 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 function buildLotAddress(lot) {
-  if (!lot) return "";
-  const line = [lot.address_line1, lot.address_line2].filter(Boolean).join(", ");
-  const cityStateZip = [lot.city, lot.state, lot.zip].filter(Boolean).join(" ");
-  return [line, cityStateZip].filter(Boolean).join(", ");
+  const line1 = lot.address_line1 || "";
+  const line2 = lot.address_line2 || "";
+  const city = lot.city || "";
+  const state = lot.state || "";
+  const zip = lot.zip || "";
+
+  const street = [line1, line2].filter(Boolean).join(", ");
+  const cityStateZip = [city, state, zip].filter(Boolean).join(" ");
+  return [street, cityStateZip].filter(Boolean).join(", ");
 }
 
 function buildGoogleMapsUrl(lot) {
-  if (!lot) return "";
   const address = buildLotAddress(lot);
-  const gps =
-    lot.latitude != null && lot.longitude != null
+
+  // Prefer address; fallback to lat/long; last resort: lot name
+  const query =
+    address ||
+    (lot.latitude != null && lot.longitude != null
       ? `${lot.latitude},${lot.longitude}`
-      : "";
-  const query = address || gps || lot.lot_code || lot.name || "";
-  if (!query) return "";
+      : lot.name || lot.lot_code || "OpenYard lot");
+
   return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
     query
   )}`;
@@ -120,8 +126,10 @@ export async function createBooking(conversation) {
     metadata: {
       booking_id: booking.id,
     },
-    success_url: process.env.CHECKOUT_SUCCESS_URL || "https://openyardpark.com",
-    cancel_url: process.env.CHECKOUT_CANCEL_URL || "https://openyardpark.com",
+    success_url:
+      process.env.CHECKOUT_SUCCESS_URL || "https://openyardpark.com",
+    cancel_url:
+      process.env.CHECKOUT_CANCEL_URL || "https://openyardpark.com",
   });
 
   await supabase
@@ -164,7 +172,9 @@ export async function stripeWebhookHandler(req, res) {
 
     if (!bookingId) {
       console.warn("Stripe: missing booking_id");
-      await notifyOwnerAlert("Stripe checkout.session.completed missing booking_id");
+      await notifyOwnerAlert(
+        "Stripe checkout.session.completed missing booking_id"
+      );
       return res.send("ok");
     }
 
@@ -211,37 +221,36 @@ export async function stripeWebhookHandler(req, res) {
 
     if (lotErr) {
       console.error("Error loading lot for confirmation:", lotErr);
-      await notifyOwnerAlert(`Error loading lot for confirmation: ${lotErr.message}`);
+      await notifyOwnerAlert(
+        `Error loading lot for confirmation: ${lotErr.message}`
+      );
     }
 
     const lotName = lot?.name || "OpenYard lot";
-    const lotCode = lot?.lot_code || "";
-    const address = buildLotAddress(lot);
-    const mapsUrl = buildGoogleMapsUrl(lot);
-    const gpsLine =
-      lot?.latitude != null && lot?.longitude != null
-        ? `GPS: ${lot.latitude}, ${lot.longitude}\n`
-        : "";
+    const lotCode = lot?.lot_code ? ` (${lot.lot_code})` : "";
+    const address = lot ? buildLotAddress(lot) : "";
+    const mapsUrl = lot ? buildGoogleMapsUrl(lot) : "";
+    const hasGps = lot?.latitude != null && lot?.longitude != null;
+    const gpsLine = hasGps ? `${lot.latitude}, ${lot.longitude}` : "";
+
     const instructions =
       lot && lot.parking_instructions
         ? lot.parking_instructions
         : "Park in marked truck stalls.";
 
-    const header = `✅ Confirmed — you’re booked at ${lotName}${
-      lotCode ? ` (${lotCode})` : ""
-    }\n\n`;
-
     const confirmMsg =
-      header +
+      "✅ Booking confirmed!\n" +
+      `${lotName}${lotCode}\n` +
       (address ? `Address: ${address}\n` : "") +
       (mapsUrl ? `Maps: ${mapsUrl}\n` : "") +
-      gpsLine +
+      (gpsLine ? `GPS: ${gpsLine}\n` : "") +
       `Dates: ${booking.start_date} to ${booking.end_date}\n` +
-      `Plate: ${booking.license_plate_raw}\n\n` +
-      `Special instructions:\n${instructions}\n\n` +
-      "Keep this text as your receipt.\n" +
-      "Need help? Reply SUPPORT\n" +
-      "Cancel? Reply CANCEL";
+      (booking.license_plate_raw ? `Plate: ${booking.license_plate_raw}\n` : "") +
+      "\n" +
+      "Special instructions:\n" +
+      `${instructions}\n\n` +
+      "Need help? Reply SUPPORT.\n" +
+      "Commands: BOOK, CANCEL, RESET, SUPPORT";
 
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER,
@@ -271,4 +280,3 @@ export async function stripeWebhookHandler(req, res) {
 
   res.send("ok");
 }
-```0
