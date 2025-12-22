@@ -1,4 +1,3 @@
-// payments/index.js
 import "dotenv/config";
 import Stripe from "stripe";
 import { supabase, logSms, updateConversation } from "../db/db.js";
@@ -28,7 +27,7 @@ function buildLotAddress(lot) {
 function buildGoogleMapsUrl(lot) {
   const address = buildLotAddress(lot);
 
-  // Prefer address; fallback to lat/long; last resort: lot name
+  // Prefer address; fallback to lat/long; last resort: lot name / lot code
   const query =
     address ||
     (lot.latitude != null && lot.longitude != null
@@ -238,19 +237,20 @@ export async function stripeWebhookHandler(req, res) {
         ? lot.parking_instructions
         : "Park in marked truck stalls.";
 
+    // UPDATED CONFIRMATION MESSAGE (no email receipt prompt)
     const confirmMsg =
       "✅ Booking confirmed!\n" +
       `${lotName}${lotCode}\n` +
-      (address ? `Address: ${address}\n` : "") +
-      (mapsUrl ? `Maps: ${mapsUrl}\n` : "") +
-      (gpsLine ? `GPS: ${gpsLine}\n` : "") +
       `Dates: ${booking.start_date} to ${booking.end_date}\n` +
       (booking.license_plate_raw ? `Plate: ${booking.license_plate_raw}\n` : "") +
       "\n" +
+      (address ? `Address: ${address}\n` : "") +
+      (mapsUrl ? `Navigate: ${mapsUrl}\n` : "") +
+      (gpsLine ? `GPS: ${gpsLine}\n` : "") +
+      "\n" +
       "Special instructions:\n" +
       `${instructions}\n\n` +
-      "Need help? Reply SUPPORT.\n" +
-      "Commands: BOOK, CANCEL, RESET, SUPPORT";
+      "Keep this text for your records. Reply SUPPORT if you need help.";
 
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER,
