@@ -1,27 +1,48 @@
 // payments/index.js
-import 'dotenv/config';
-import Stripe from 'stripe';
-import { supabase, logSms, updateConversation } from '../db/db.js';
+import "dotenv/config";
+import Stripe from "stripe";
+import { supabase, logSms, updateConversation } from "../db/db.js";
 import {
   twilioClient,
   notifyOwnerAlert,
   computePricing,
   computeReviewSendAt,
-} from '../utils/index.js';
+} from "../utils/index.js";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: '2023-10-16',
+  apiVersion: "2023-10-16",
 });
+
+function buildLotAddress(lot) {
+  if (!lot) return "";
+  const line = [lot.address_line1, lot.address_line2].filter(Boolean).join(", ");
+  const cityStateZip = [lot.city, lot.state, lot.zip].filter(Boolean).join(" ");
+  return [line, cityStateZip].filter(Boolean).join(", ");
+}
+
+function buildGoogleMapsUrl(lot) {
+  if (!lot) return "";
+  const address = buildLotAddress(lot);
+  const gps =
+    lot.latitude != null && lot.longitude != null
+      ? `${lot.latitude},${lot.longitude}`
+      : "";
+  const query = address || gps || lot.lot_code || lot.name || "";
+  if (!query) return "";
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+    query
+  )}`;
+}
 
 export async function createBooking(conversation) {
   const { data: conv, error: convErr } = await supabase
-    .from('conversations')
-    .select('*')
-    .eq('id', conversation.id)
+    .from("conversations")
+    .select("*")
+    .eq("id", conversation.id)
     .single();
 
   if (convErr) {
-    console.error('Error reloading conversation for booking:', convErr);
+    console.error("Error reloading conversation for booking:", convErr);
     await notifyOwnerAlert(
       `Error reloading conversation for booking: ${convErr.message}`
     );
@@ -29,13 +50,13 @@ export async function createBooking(conversation) {
   }
 
   const { data: lot, error: lotErr } = await supabase
-    .from('lots')
-    .select('*')
-    .eq('id', conv.lot_id)
+    .from("lots")
+    .select("*")
+    .eq("id", conv.lot_id)
     .single();
 
   if (lotErr) {
-    console.error('Error loading lot for booking:', lotErr);
+    console.error("Error loading lot for booking:", lotErr);
     await notifyOwnerAlert(`Error loading lot for booking: ${lotErr.message}`);
     return "We couldn't find that lot. Try again.";
   }
@@ -49,7 +70,7 @@ export async function createBooking(conversation) {
   const endDate = end.toISOString().slice(0, 10);
 
   const { data: booking, error: bookingErr } = await supabase
-    .from('bookings')
+    .from("bookings")
     .insert({
       conversation_id: conv.id,
       lot_id: conv.lot_id,
@@ -68,26 +89,26 @@ export async function createBooking(conversation) {
       subtotal_cents: pricing.subtotal_cents,
       deposit_hold_cents: pricing.deposit_hold_cents,
       total_cents: pricing.total_cents,
-      currency: 'usd',
-      status: 'pending_payment',
+      currency: "usd",
+      status: "pending_payment",
     })
     .select()
     .single();
 
   if (bookingErr) {
-    console.error('Supabase insert booking error:', bookingErr);
+    console.error("Supabase insert booking error:", bookingErr);
     await notifyOwnerAlert(`Supabase insert booking error: ${bookingErr.message}`);
     return "We couldn't create your booking. Please try again.";
   }
 
   const session = await stripe.checkout.sessions.create({
-    mode: 'payment',
-    payment_method_types: ['card'],
+    mode: "payment",
+    payment_method_types: ["card"],
     line_items: [
       {
         quantity: 1,
         price_data: {
-          currency: 'usd',
+          currency: "usd",
           unit_amount: pricing.total_cents,
           product_data: {
             name: `Truck Parking – ${lot.name}`,
@@ -99,32 +120,30 @@ export async function createBooking(conversation) {
     metadata: {
       booking_id: booking.id,
     },
-    success_url:
-      process.env.CHECKOUT_SUCCESS_URL || 'https://openyardpark.com',
-    cancel_url:
-      process.env.CHECKOUT_CANCEL_URL || 'https://openyardpark.com',
+    success_url: process.env.CHECKOUT_SUCCESS_URL || "https://openyardpark.com",
+    cancel_url: process.env.CHECKOUT_CANCEL_URL || "https://openyardpark.com",
   });
 
   await supabase
-    .from('bookings')
+    .from("bookings")
     .update({
       stripe_session_id: session.id,
       updated_at: new Date().toISOString(),
     })
-    .eq('id', booking.id);
+    .eq("id", booking.id);
 
   await updateConversation(conv.id, {
     booking_id: booking.id,
-    current_state: 'awaiting_payment',
+    current_state: "awaiting_payment",
   });
 
-  await logSms(conv.id, conv.driver_phone_e164, 'outbound', session.url);
+  await logSms(conv.id, conv.driver_phone_e164, "outbound", session.url);
 
-  return 'Here’s your secure payment link:\n' + session.url;
+  return "Here’s your secure payment link:\n" + session.url;
 }
 
 export async function stripeWebhookHandler(req, res) {
-  const sig = req.headers['stripe-signature'];
+  const sig = req.headers["stripe-signature"];
 
   let event;
   try {
@@ -134,86 +153,95 @@ export async function stripeWebhookHandler(req, res) {
       process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (err) {
-    console.error('Stripe signature error:', err.message);
+    console.error("Stripe signature error:", err.message);
     await notifyOwnerAlert(`Stripe signature error: ${err.message}`);
-    return res.status(400).send('Invalid signature');
+    return res.status(400).send("Invalid signature");
   }
 
-  if (event.type === 'checkout.session.completed') {
+  if (event.type === "checkout.session.completed") {
     const session = event.data.object;
     const bookingId = session.metadata && session.metadata.booking_id;
 
     if (!bookingId) {
-      console.warn('Stripe: missing booking_id');
-      await notifyOwnerAlert(
-        'Stripe checkout.session.completed missing booking_id'
-      );
-      return res.send('ok');
+      console.warn("Stripe: missing booking_id");
+      await notifyOwnerAlert("Stripe checkout.session.completed missing booking_id");
+      return res.send("ok");
     }
 
     const nowIso = new Date().toISOString();
 
     const { data: rows, error: updErr } = await supabase
-      .from('bookings')
+      .from("bookings")
       .update({
-        status: 'confirmed',
+        status: "confirmed",
         paid_at: nowIso,
         stripe_payment_intent_id: session.payment_intent,
         stripe_customer_id: session.customer,
       })
-      .eq('id', bookingId)
+      .eq("id", bookingId)
       .select()
       .limit(1);
 
     if (updErr || !rows || rows.length === 0) {
-      console.error('Error updating booking on payment:', updErr);
+      console.error("Error updating booking on payment:", updErr);
       await notifyOwnerAlert(
         `Error updating booking on payment: ${
-          updErr ? updErr.message : 'no rows returned'
+          updErr ? updErr.message : "no rows returned"
         }`
       );
-      return res.send('ok');
+      return res.send("ok");
     }
 
     const booking = rows[0];
 
     await supabase
-      .from('conversations')
+      .from("conversations")
       .update({
         is_active: false,
-        current_state: 'completed',
+        current_state: "completed",
         updated_at: nowIso,
       })
-      .eq('id', booking.conversation_id);
+      .eq("id", booking.conversation_id);
 
     const { data: lot, error: lotErr } = await supabase
-      .from('lots')
-      .select('*')
-      .eq('id', booking.lot_id)
+      .from("lots")
+      .select("*")
+      .eq("id", booking.lot_id)
       .single();
 
     if (lotErr) {
-      console.error('Error loading lot for confirmation:', lotErr);
-      await notifyOwnerAlert(
-        `Error loading lot for confirmation: ${lotErr.message}`
-      );
+      console.error("Error loading lot for confirmation:", lotErr);
+      await notifyOwnerAlert(`Error loading lot for confirmation: ${lotErr.message}`);
     }
 
+    const lotName = lot?.name || "OpenYard lot";
+    const lotCode = lot?.lot_code || "";
+    const address = buildLotAddress(lot);
+    const mapsUrl = buildGoogleMapsUrl(lot);
+    const gpsLine =
+      lot?.latitude != null && lot?.longitude != null
+        ? `GPS: ${lot.latitude}, ${lot.longitude}\n`
+        : "";
     const instructions =
       lot && lot.parking_instructions
         ? lot.parking_instructions
-        : 'Park in marked truck stalls.';
+        : "Park in marked truck stalls.";
+
+    const header = `✅ Confirmed — you’re booked at ${lotName}${
+      lotCode ? ` (${lotCode})` : ""
+    }\n\n`;
 
     const confirmMsg =
-      '✅ Your booking is confirmed!\n' +
-      `${lot ? lot.name : 'OpenYard lot'}${
-        lot && lot.region_label ? ' – ' + lot.region_label : ''
-      }\n` +
+      header +
+      (address ? `Address: ${address}\n` : "") +
+      (mapsUrl ? `Maps: ${mapsUrl}\n` : "") +
+      gpsLine +
       `Dates: ${booking.start_date} to ${booking.end_date}\n` +
       `Plate: ${booking.license_plate_raw}\n\n` +
-      `Instructions:\n${instructions}\n\n` +
-      'Keep this text as your receipt.\n' +
-      'Want an email receipt too? Reply with your email address.';
+      `Special instructions:\n${instructions}\n\n` +
+      "Keep this text as your receipt.\n" +
+      "Need help? Reply SUPPORT\n" +
+      "Cancel? Reply CANCEL";
 
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER,
@@ -224,89 +252,23 @@ export async function stripeWebhookHandler(req, res) {
     await logSms(
       booking.conversation_id,
       booking.driver_phone_e164,
-      'outbound',
+      "outbound",
       confirmMsg
     );
 
     const sendAtIso = computeReviewSendAt(lot);
     const driverName = booking.driver_full_name || null;
 
-    await supabase.from('scheduled_messages').insert({
+    await supabase.from("scheduled_messages").insert({
       booking_id: booking.id,
       lot_id: booking.lot_id,
       driver_phone_e164: booking.driver_phone_e164,
       driver_full_name: driverName,
-      message_type: 'review_nudge',
+      message_type: "review_nudge",
       send_at: sendAtIso,
     });
   }
 
-  res.send('ok');
+  res.send("ok");
 }
-
-/**
- * Handle a driver texting an email address to get a receipt.
- * We find their most recent confirmed booking and attach the email
- * to the underlying Stripe PaymentIntent so Stripe emails a receipt.
- */
-export async function handleEmailForReceipt(phone, emailRaw) {
-  const email = emailRaw.trim();
-
-  const { data: bookingRows, error } = await supabase
-    .from('bookings')
-    .select('*')
-    .eq('driver_phone_e164', phone)
-    .eq('status', 'confirmed')
-    .order('paid_at', { ascending: false })
-    .limit(1);
-
-  if (error || !bookingRows || bookingRows.length === 0) {
-    console.error('No confirmed booking found for email receipt:', error);
-    await notifyOwnerAlert(
-      `No confirmed booking found for email receipt for ${phone}`
-    );
-    return (
-      "I couldn't find a recent confirmed booking to attach that email to.\n" +
-      'If you just booked and this keeps happening, text SUPPORT.'
-    );
-  }
-
-  const booking = bookingRows[0];
-
-  // Optional: store email in bookings table if you add a column later
-  try {
-    await supabase
-      .from('bookings')
-      .update({
-        receipt_email: email,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', booking.id);
-  } catch (err) {
-    console.error('Error saving receipt_email on booking:', err);
-  }
-
-  // Ask Stripe to email a receipt for this payment
-  try {
-    if (booking.stripe_payment_intent_id) {
-      await stripe.paymentIntents.update(booking.stripe_payment_intent_id, {
-        receipt_email: email,
-      });
-    } else {
-      console.warn(
-        'No stripe_payment_intent_id on booking when handling email receipt.'
-      );
-    }
-  } catch (err) {
-    console.error('Error updating PaymentIntent receipt_email:', err);
-    await notifyOwnerAlert(
-      `Error setting receipt_email on PI for booking ${booking.id}: ${err.message}`
-    );
-    return (
-      `I saved ${email} but had trouble sending the receipt automatically.\n` +
-      'If you do not receive it, email alex@openyardpark.com.'
-    );
-  }
-
-  return `Got it. We’ll email a Stripe receipt to ${email} shortly.`;
-}
+```0
