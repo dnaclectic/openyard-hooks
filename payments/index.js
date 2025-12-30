@@ -19,6 +19,9 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
 });
 
+// How long a stall is “held” while driver completes Stripe checkout
+const HOLD_MINUTES = Number(process.env.BOOKING_HOLD_MINUTES || 10);
+
 function templatePaymentLink({ lotName, lotCode, nights, totalCents, url }) {
   const dollars = Math.round(Number(totalCents) / 100);
   const lotLine = `${lotName}${lotCode ? ` (${lotCode})` : ""}`;
@@ -70,17 +73,19 @@ function isoDate(d) {
 }
 
 function addDaysIso(startIso, days) {
-  // Use UTC math so it’s stable; we’re treating dates as date-only
   const d = new Date(startIso + "T00:00:00Z");
   d.setUTCDate(d.getUTCDate() + days);
   return isoDate(d);
+}
+
+function holdExpiresAtIso(minutes = 10) {
+  return new Date(Date.now() + minutes * 60 * 1000).toISOString();
 }
 
 async function getStallsLeftTonight(lotId) {
   try {
     const { data, error } = await supabase.rpc("openyard_stalls_left", {
       p_lot_id: lotId,
-      // p_date omitted => function uses lot timezone "today"
     });
     if (error) throw error;
     return typeof data === "number" ? data : null;
@@ -134,28 +139,26 @@ export async function createBooking(conversation) {
 
   const pricing = computePricing(lot, conv.stay_type, conv.nights);
 
-  // Dates (date-only)
   const nights = Number(conv.nights || 1);
   const startDate = isoDate(new Date());
   const endDate = addDaysIso(startDate, nights);
 
-  // ---- CAPACITY GUARD (prevents Stripe/booking when sold out) ----
+  // ---- CAPACITY GUARD ----
   let minSpots = null;
-
   if (nights <= 1) {
     minSpots = await getStallsLeftTonight(lot.id);
   } else {
     minSpots = await getMinStallsLeftForStay(lot.id, startDate, endDate);
   }
 
-  // If RPC failed, we fail OPEN (don’t block), but alert you.
+  // Fail open but alert you
   if (minSpots === null) {
     await notifyOwnerAlert(
       `Capacity check failed (RPC returned null). Lot ${lot.lot_code || lot.id}`
     );
   }
 
-  // If capacity check succeeded and is 0, block checkout
+  // If we know it’s sold out, block
   if (typeof minSpots === "number" && minSpots <= 0) {
     const msg =
       `That lot is sold out for your dates (${startDate} to ${endDate}).\n` +
@@ -164,7 +167,9 @@ export async function createBooking(conversation) {
     await logSms(conv.id, conv.driver_phone_e164, "outbound", msg);
     return msg;
   }
-  // ---------------------------------------------------------------
+  // ------------------------
+
+  const holdExpiresAt = holdExpiresAtIso(HOLD_MINUTES);
 
   const { data: booking, error: bookingErr } = await supabase
     .from("bookings")
@@ -188,6 +193,9 @@ export async function createBooking(conversation) {
       total_cents: pricing.total_cents,
       currency: "usd",
       status: "pending_payment",
+
+      // ✅ THIS is what makes pending_payment bookings count as “reserved”
+      hold_expires_at: holdExpiresAt,
     })
     .select()
     .single();
@@ -286,6 +294,10 @@ export async function stripeWebhookHandler(req, res) {
         paid_at: nowIso,
         stripe_payment_intent_id: session.payment_intent,
         stripe_customer_id: session.customer,
+        confirmed_at: nowIso,
+
+        // optional: once paid, hold no longer needed
+        hold_expires_at: null,
       })
       .eq("id", bookingId)
       .select()
