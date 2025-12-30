@@ -131,6 +131,33 @@ function templateConfirmation({
   return lines.join("\n");
 }
 
+/**
+ * ✅ Service-day helpers (8am rollover)
+ * If it's before 8am local server time, we treat "today" as the previous service day.
+ * This avoids the "books 12/30 at 1am but start_date is 12/31" problem.
+ */
+function serviceDayISO({ rolloverHourLocal = 8 } = {}) {
+  const now = new Date();
+  const service = new Date(now);
+  if (now.getHours() < rolloverHourLocal) {
+    service.setDate(service.getDate() - 1);
+  }
+
+  const yyyy = service.getFullYear();
+  const mm = String(service.getMonth() + 1).padStart(2, "0");
+  const dd = String(service.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function addDaysISO(dateStr, days) {
+  const d = new Date(`${dateStr}T00:00:00`);
+  d.setDate(d.getDate() + Number(days || 0));
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
 export async function createBooking(conversation) {
   const { data: conv, error: convErr } = await supabase
     .from("conversations")
@@ -160,11 +187,9 @@ export async function createBooking(conversation) {
 
   const pricing = computePricing(lot, conv.stay_type, conv.nights);
 
-  const today = new Date();
-  const startDate = today.toISOString().slice(0, 10);
-  const end = new Date(today);
-  end.setDate(end.getDate() + (conv.nights || 1));
-  const endDate = end.toISOString().slice(0, 10);
+  // ✅ FIX: 8am service-day rollover for start_date/end_date
+  const startDate = serviceDayISO({ rolloverHourLocal: 8 });
+  const endDate = addDaysISO(startDate, conv.nights || 1);
 
   const { data: booking, error: bookingErr } = await supabase
     .from("bookings")
@@ -194,7 +219,9 @@ export async function createBooking(conversation) {
 
   if (bookingErr) {
     console.error("Supabase insert booking error:", bookingErr);
-    await notifyOwnerAlert(`Supabase insert booking error: ${bookingErr.message}`);
+    await notifyOwnerAlert(
+      `Supabase insert booking error: ${bookingErr.message}`
+    );
     return "We couldn't create your booking. Please try again.";
   }
 
@@ -331,7 +358,9 @@ export async function stripeWebhookHandler(req, res) {
     const addressLine =
       addressRaw && hasMeaningfulAddress(addressRaw) ? addressRaw : "";
 
-    const nav = lot ? buildNavigateLink(lot) : { url: "", gpsLine: "", used: "name" };
+    const nav = lot
+      ? buildNavigateLink(lot)
+      : { url: "", gpsLine: "", used: "name" };
     const navigateUrl = nav.url || "https://www.google.com/maps";
     const gpsLine = nav.gpsLine || "";
 
