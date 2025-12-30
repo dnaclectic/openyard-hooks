@@ -39,7 +39,8 @@ function parseCityState(raw) {
 }
 
 async function findLotsByCodeOrSlug(raw) {
-  const slugCandidate = String(raw || "").toLowerCase().replace(/\s+/g, "-");
+  // Try slug/lot_code exact-ish match
+  const slugCandidate = raw.toLowerCase().replace(/\s+/g, "-");
 
   const { data, error } = await supabase
     .from("lots")
@@ -63,34 +64,50 @@ async function findLotsByCityState(city, state) {
   return data || [];
 }
 
-async function getStallsLeftToday(lotId) {
+// ---------- NEW: stalls-left helpers ----------
+
+async function getStallsLeftTonight(lotId) {
   try {
     const { data, error } = await supabase.rpc("openyard_stalls_left", {
       p_lot_id: lotId,
-      p_date: null, // let the function compute "today" in the lot timezone
+      // p_date omitted => function uses lot timezone "today"
     });
-
-    if (error) {
-      console.error("RPC openyard_stalls_left error:", error);
-      return null; // treat as unknown, don't hard-block
-    }
-
-    // Supabase RPC returns the scalar directly in `data`
-    const n = Number(data);
-    if (!Number.isFinite(n)) return null;
-    return n;
+    if (error) throw error;
+    if (typeof data === "number") return data;
+    return null;
   } catch (err) {
-    console.error("getStallsLeftToday exception:", err);
+    console.error("RPC openyard_stalls_left error:", err);
     return null;
   }
 }
 
-function soldOutMessage(lotName) {
-  return (
-    `⚠️ ${lotName || "That lot"} is sold out tonight.\n\n` +
-    "Reply with another city/state to see nearby lots, or text BOOK to start over."
-  );
+async function getMinStallsLeftForStay(lotId, startDate, endDate) {
+  try {
+    const { data, error } = await supabase.rpc("openyard_stalls_left_range", {
+      p_lot_id: lotId,
+      p_start_date: startDate,
+      p_end_date: endDate,
+    });
+    if (error) throw error;
+    if (typeof data === "number") return data;
+    return null;
+  } catch (err) {
+    console.error("RPC openyard_stalls_left_range error:", err);
+    return null;
+  }
 }
+
+function isoDate(d) {
+  return new Date(d).toISOString().slice(0, 10);
+}
+
+function addDaysIso(startIso, days) {
+  const d = new Date(startIso + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  return isoDate(d);
+}
+
+// ---------------------------------------------
 
 export async function handleLocationState(conversation, text) {
   const raw = String(text || "").trim();
@@ -117,33 +134,42 @@ export async function handleLocationState(conversation, text) {
   if (lots.length === 1) {
     const lot = lots[0];
 
-    // Stall gate (Option A: only nightly/today matters)
-    const stallsLeft = await getStallsLeftToday(lot.id);
-    if (stallsLeft !== null && stallsLeft <= 0) {
-      return soldOutMessage(lot.name);
-    }
-
     await updateConversation(conversation.id, {
       lot_id: lot.id,
       current_state: "awaiting_name",
     });
 
-    const suffix =
-      stallsLeft !== null ? `\nStalls left tonight: ${stallsLeft}` : "";
+    const stallsLeft = await getStallsLeftTonight(lot.id);
+    const stallsLine =
+      typeof stallsLeft === "number" ? `\nSpots left tonight: ${stallsLeft}` : "";
 
     return (
       `You’re booking: ${lot.name}${
         lot.region_label ? " – " + lot.region_label : ""
-      }.${suffix}\n\n` + "What’s your first and last name?"
+      }.${stallsLine}\n\n` + "What’s your first and last name?"
     );
   }
 
   // MULTIPLE LOTS
   const limited = lots.slice(0, 5);
-  const lines = limited.map(
-    (lot, i) =>
-      `${i + 1}) ${lot.name}${lot.region_label ? " – " + lot.region_label : ""}`
+
+  // Fetch stalls left tonight for each lot (parallel)
+  const stalls = await Promise.all(
+    limited.map(async (lot) => ({
+      lotId: lot.id,
+      stallsLeft: await getStallsLeftTonight(lot.id),
+    }))
   );
+
+  const stallsById = new Map(stalls.map((s) => [s.lotId, s.stallsLeft]));
+
+  const lines = limited.map((lot, i) => {
+    const left = stallsById.get(lot.id);
+    const leftTxt = typeof left === "number" ? ` • ${left} left` : "";
+    return `${i + 1}) ${lot.name}${
+      lot.region_label ? " – " + lot.region_label : ""
+    }${leftTxt}`;
+  });
 
   await updateConversation(conversation.id, {
     current_state: "awaiting_lot_choice",
@@ -173,24 +199,19 @@ export async function handleLotChoiceState(conversation, text) {
 
   const chosen = limited[n - 1];
 
-  // Stall gate (Option A: only nightly/today matters)
-  const stallsLeft = await getStallsLeftToday(chosen.id);
-  if (stallsLeft !== null && stallsLeft <= 0) {
-    return soldOutMessage(chosen.name);
-  }
-
   await updateConversation(conversation.id, {
     lot_id: chosen.id,
     current_state: "awaiting_name",
   });
 
-  const suffix =
-    stallsLeft !== null ? `\nStalls left tonight: ${stallsLeft}` : "";
+  const stallsLeft = await getStallsLeftTonight(chosen.id);
+  const stallsLine =
+    typeof stallsLeft === "number" ? `\nSpots left tonight: ${stallsLeft}` : "";
 
   return (
     `You’re booking: ${chosen.name}${
       chosen.region_label ? " – " + chosen.region_label : ""
-    }.${suffix}\n\n` + "What’s your first and last name?"
+    }.${stallsLine}\n\n` + "What’s your first and last name?"
   );
 }
 
@@ -342,9 +363,32 @@ export async function buildSummaryPrompt(conversationId, stayType, nights) {
     quoted_total_cents: pricing.total_cents,
   });
 
+  // Availability: tonight + minimum across stay
+  const stallsTonight = await getStallsLeftTonight(lot.id);
+
+  // NOTE: We’re using server “today” ISO for range start.
+  // (Good enough for now; the per-day function uses lot timezone if date omitted.)
+  const startDate = isoDate(new Date());
+  const endDate = addDaysIso(startDate, Number(nights || 1));
+  const stallsMin =
+    Number(nights || 1) > 1
+      ? await getMinStallsLeftForStay(lot.id, startDate, endDate)
+      : stallsTonight;
+
+  const stallsLines = [];
+  if (typeof stallsTonight === "number") {
+    stallsLines.push(`• Spots left tonight: ${stallsTonight}`);
+  }
+  if (typeof stallsMin === "number" && Number(nights || 1) > 1) {
+    stallsLines.push(`• Min spots during stay: ${stallsMin}`);
+  }
+
+  const stallsBlock = stallsLines.length ? `\n${stallsLines.join("\n")}\n` : "\n";
+
   return withCommandsFooter(
     "Here’s your booking:\n" +
       `• Lot: ${lot.name}${lot.region_label ? " – " + lot.region_label : ""}\n` +
+      stallsBlock +
       `• Name: ${conv.driver_full_name}\n` +
       `• Truck: ${conv.truck_type} – ${conv.truck_make_model}\n` +
       `• Plate: ${conv.license_plate_raw}\n` +
