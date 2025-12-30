@@ -1,7 +1,7 @@
 // sms/states/index.js
 import "dotenv/config";
 import { supabase, updateConversation, logSms } from "../../db/db.js";
-import { computePricing, notifyOwnerAlert } from "../../utils/index.js";
+import { notifyOwnerAlert } from "../../utils/index.js";
 import { formatDateRange } from "../../utils/lotLinks.js";
 
 // Commands footer – used only on first prompt and summary
@@ -16,12 +16,6 @@ export function withCommandsFooter(mainText) {
  * Parse location input into either:
  * - lot code / slug exact match candidate (raw)
  * - city + optional state (supports multi-word cities)
- *
- * Examples:
- *  "Bozeman MT"
- *  "Kansas City MO"
- *  "Los Angeles CA"
- *  "kcmo-01" (lot code)
  */
 function parseCityState(raw) {
   const cleaned = String(raw || "").trim().replace(/\s+/g, " ");
@@ -30,7 +24,6 @@ function parseCityState(raw) {
   const parts = cleaned.split(" ");
   if (parts.length === 1) return { city: cleaned, state: null };
 
-  // If last token looks like a 2-letter state code, treat it as state
   const last = parts[parts.length - 1];
   const state = /^[A-Za-z]{2}$/.test(last) ? last.toUpperCase() : null;
 
@@ -39,7 +32,6 @@ function parseCityState(raw) {
 }
 
 async function findLotsByCodeOrSlug(raw) {
-  // Try slug/lot_code exact-ish match
   const slugCandidate = raw.toLowerCase().replace(/\s+/g, "-");
 
   const { data, error } = await supabase
@@ -64,17 +56,15 @@ async function findLotsByCityState(city, state) {
   return data || [];
 }
 
-// ---------- NEW: stalls-left helpers ----------
+// ---------- stalls-left helpers ----------
 
 async function getStallsLeftTonight(lotId) {
   try {
     const { data, error } = await supabase.rpc("openyard_stalls_left", {
       p_lot_id: lotId,
-      // p_date omitted => function uses lot timezone "today"
     });
     if (error) throw error;
-    if (typeof data === "number") return data;
-    return null;
+    return typeof data === "number" ? data : null;
   } catch (err) {
     console.error("RPC openyard_stalls_left error:", err);
     return null;
@@ -89,8 +79,7 @@ async function getMinStallsLeftForStay(lotId, startDate, endDate) {
       p_end_date: endDate,
     });
     if (error) throw error;
-    if (typeof data === "number") return data;
-    return null;
+    return typeof data === "number" ? data : null;
   } catch (err) {
     console.error("RPC openyard_stalls_left_range error:", err);
     return null;
@@ -102,12 +91,12 @@ function isoDate(d) {
 }
 
 function addDaysIso(startIso, days) {
-  const d = new Date(startIso + "T00:00:00Z");
-  d.setUTCDate(d.getUTCDate() + days);
-  return isoDate(d);
+  const dt = new Date(startIso + "T00:00:00Z");
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return isoDate(dt);
 }
 
-// ---------------------------------------------
+// ----------------------------------------
 
 export async function handleLocationState(conversation, text) {
   const raw = String(text || "").trim();
@@ -117,7 +106,7 @@ export async function handleLocationState(conversation, text) {
   // 1) Try code/slug match first
   let lots = await findLotsByCodeOrSlug(raw);
 
-  // 2) If none, try city/state (supports multi-word city names)
+  // 2) If none, try city/state
   if (!lots || lots.length === 0) {
     const { city, state } = parseCityState(raw);
     if (city) lots = await findLotsByCityState(city, state);
@@ -134,12 +123,23 @@ export async function handleLocationState(conversation, text) {
   if (lots.length === 1) {
     const lot = lots[0];
 
+    const stallsLeft = await getStallsLeftTonight(lot.id);
+
+    // If we KNOW it's sold out, block early (prevents wasting steps)
+    if (typeof stallsLeft === "number" && stallsLeft <= 0) {
+      return (
+        `Sorry — ${lot.name}${
+          lot.region_label ? " – " + lot.region_label : ""
+        } is sold out tonight.\n\n` +
+        'Try another city/state, or text SUPPORT.'
+      );
+    }
+
     await updateConversation(conversation.id, {
       lot_id: lot.id,
       current_state: "awaiting_name",
     });
 
-    const stallsLeft = await getStallsLeftTonight(lot.id);
     const stallsLine =
       typeof stallsLeft === "number" ? `\nSpots left tonight: ${stallsLeft}` : "";
 
@@ -153,7 +153,6 @@ export async function handleLocationState(conversation, text) {
   // MULTIPLE LOTS
   const limited = lots.slice(0, 5);
 
-  // Fetch stalls left tonight for each lot (parallel)
   const stalls = await Promise.all(
     limited.map(async (lot) => ({
       lotId: lot.id,
@@ -187,11 +186,8 @@ export async function handleLotChoiceState(conversation, text) {
   const input = conversation.location_raw_input || "";
   const { city, state } = parseCityState(input);
 
-  // Re-fetch using the same city/state logic (most common for multi-lot results)
   let lots = [];
   if (city) lots = await findLotsByCityState(city, state);
-
-  // Fallback to code/slug search if city/state fails (edge cases)
   if (!lots || lots.length === 0) lots = await findLotsByCodeOrSlug(input);
 
   const limited = (lots || []).slice(0, 5);
@@ -199,12 +195,25 @@ export async function handleLotChoiceState(conversation, text) {
 
   const chosen = limited[n - 1];
 
+  const stallsLeft = await getStallsLeftTonight(chosen.id);
+
+  // If we KNOW it's sold out, block early and keep them in lot-choice state
+  if (typeof stallsLeft === "number" && stallsLeft <= 0) {
+    await updateConversation(conversation.id, {
+      current_state: "awaiting_lot_choice",
+    });
+
+    return (
+      `That lot is sold out tonight.\n` +
+      `Reply with a different number from the list, or text SUPPORT.`
+    );
+  }
+
   await updateConversation(conversation.id, {
     lot_id: chosen.id,
     current_state: "awaiting_name",
   });
 
-  const stallsLeft = await getStallsLeftTonight(chosen.id);
   const stallsLine =
     typeof stallsLeft === "number" ? `\nSpots left tonight: ${stallsLeft}` : "";
 
@@ -236,12 +245,7 @@ export async function handleNameState(conversation, text) {
 
 export async function handleTruckTypeState(conversation, text) {
   const n = parseInt(String(text || "").trim(), 10);
-  const types = {
-    1: "semi",
-    2: "bobtail",
-    3: "hotshot",
-    4: "other",
-  };
+  const types = { 1: "semi", 2: "bobtail", 3: "hotshot", 4: "other" };
   const truckType = types[n];
   if (!truckType) return "Reply 1, 2, 3, or 4.";
 
@@ -356,18 +360,9 @@ export async function buildSummaryPrompt(conversationId, stayType, nights) {
     return "We couldn't load the lot details. Try again shortly or text SUPPORT for help.";
   }
 
-  const pricing = computePricing(lot, stayType, nights);
-  const totalDollars = (pricing.total_cents / 100).toFixed(2);
-
-  await updateConversation(conversationId, {
-    quoted_total_cents: pricing.total_cents,
-  });
-
   // Availability: tonight + minimum across stay
   const stallsTonight = await getStallsLeftTonight(lot.id);
 
-  // NOTE: We’re using server “today” ISO for range start.
-  // (Good enough for now; the per-day function uses lot timezone if date omitted.)
   const startDate = isoDate(new Date());
   const endDate = addDaysIso(startDate, Number(nights || 1));
   const stallsMin =
@@ -385,6 +380,8 @@ export async function buildSummaryPrompt(conversationId, stayType, nights) {
 
   const stallsBlock = stallsLines.length ? `\n${stallsLines.join("\n")}\n` : "\n";
 
+  // total comes from your pricing logic in payments (authoritative)
+  // Here we keep the SMS summary simple and let createBooking compute total.
   return withCommandsFooter(
     "Here’s your booking:\n" +
       `• Lot: ${lot.name}${lot.region_label ? " – " + lot.region_label : ""}\n` +
@@ -392,8 +389,7 @@ export async function buildSummaryPrompt(conversationId, stayType, nights) {
       `• Name: ${conv.driver_full_name}\n` +
       `• Truck: ${conv.truck_type} – ${conv.truck_make_model}\n` +
       `• Plate: ${conv.license_plate_raw}\n` +
-      `• Stay: ${nights} night(s)\n` +
-      `• Total: $${totalDollars}\n\n` +
+      `• Stay: ${nights} night(s)\n\n` +
       "Reply YES to get your payment link, or NO to cancel."
   );
 }
@@ -413,13 +409,12 @@ export async function handleSummaryConfirmState(conversation, text) {
     return "Reply YES to get your payment link, or NO to cancel.";
   }
 
-  // createBooking is handled in payments module; handler will call it.
   return null;
 }
 
 export async function handleAwaitingPaymentState(conversation, trimmedUpper) {
   const wantsLink = ["LINK", "PAY", "PAYMENT", "YES", "Y", "RESEND"].includes(
-    trimmedUpper
+    String(trimmedUpper || "").toUpperCase().trim()
   );
 
   if (!wantsLink) {
