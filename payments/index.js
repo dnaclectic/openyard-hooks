@@ -8,81 +8,16 @@ import {
   computePricing,
   computeReviewSendAt,
 } from "../utils/index.js";
+import {
+  buildLotAddress,
+  hasMeaningfulAddress,
+  buildNavigateLink,
+  formatDateRange,
+} from "../utils/lotLinks.js";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
 });
-
-function buildLotAddress(lot) {
-  const line1 = (lot.address_line1 || "").trim();
-  const line2 = (lot.address_line2 || "").trim();
-  const city = (lot.city || "").trim();
-  const state = (lot.state || "").trim();
-  const zip = (lot.zip || "").trim();
-
-  const street = [line1, line2].filter(Boolean).join(", ");
-  const cityStateZip = [city, state, zip].filter(Boolean).join(" ");
-  return [street, cityStateZip].filter(Boolean).join(", ").trim();
-}
-
-function hasMeaningfulAddress(address) {
-  // Prevent sending vague stuff like "Frontage Rd, Bozeman MT 59715" if you consider that too weak.
-  // If you want to allow any address_line1, just return Boolean(address).
-  if (!address) return false;
-  const a = address.toLowerCase();
-  // heuristic: must contain a number OR a comma-separated street+city
-  const hasNumber = /\d/.test(a);
-  const hasComma = a.includes(",");
-  return hasNumber || hasComma;
-}
-
-function buildGoogleMapsUrlFromQuery(query) {
-  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-    query
-  )}`;
-}
-
-function buildNavigateLink(lot) {
-  // Prefer GPS coordinates for truckers (less ambiguity)
-  const hasGps =
-    lot &&
-    lot.latitude != null &&
-    lot.longitude != null &&
-    Number.isFinite(Number(lot.latitude)) &&
-    Number.isFinite(Number(lot.longitude));
-
-  if (hasGps) {
-    const lat = Number(lot.latitude);
-    const lng = Number(lot.longitude);
-    const gps = `${lat},${lng}`;
-    return {
-      gpsLine: `${lat}, ${lng}`,
-      url: buildGoogleMapsUrlFromQuery(gps),
-      used: "gps",
-    };
-  }
-
-  const address = buildLotAddress(lot);
-  if (address && hasMeaningfulAddress(address)) {
-    return {
-      gpsLine: "",
-      url: buildGoogleMapsUrlFromQuery(address),
-      used: "address",
-    };
-  }
-
-  // last resort
-  const fallback = lot?.name || lot?.lot_code || "OpenYard lot";
-  return {
-    gpsLine: "",
-    url: buildGoogleMapsUrlFromQuery(fallback),
-    used: "name",
-  };
-}
-
-function formatDateRange(startDate, endDate) {
-  return `${startDate} to ${endDate}`;
-}
 
 function templatePaymentLink({ lotName, lotCode, nights, totalCents, url }) {
   const dollars = Math.round(Number(totalCents) / 100);
@@ -107,7 +42,6 @@ function templateConfirmation({
   gpsLine,
   instructions,
 }) {
-  // Keep it clean + scannable for SMS
   const lines = [];
 
   lines.push("✅ Booking confirmed!");
@@ -129,33 +63,6 @@ function templateConfirmation({
   lines.push("Reply SUPPORT if you need help.");
 
   return lines.join("\n");
-}
-
-/**
- * ✅ Service-day helpers (8am rollover)
- * If it's before 8am local server time, we treat "today" as the previous service day.
- * This avoids the "books 12/30 at 1am but start_date is 12/31" problem.
- */
-function serviceDayISO({ rolloverHourLocal = 8 } = {}) {
-  const now = new Date();
-  const service = new Date(now);
-  if (now.getHours() < rolloverHourLocal) {
-    service.setDate(service.getDate() - 1);
-  }
-
-  const yyyy = service.getFullYear();
-  const mm = String(service.getMonth() + 1).padStart(2, "0");
-  const dd = String(service.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function addDaysISO(dateStr, days) {
-  const d = new Date(`${dateStr}T00:00:00`);
-  d.setDate(d.getDate() + Number(days || 0));
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
 }
 
 export async function createBooking(conversation) {
@@ -187,9 +94,11 @@ export async function createBooking(conversation) {
 
   const pricing = computePricing(lot, conv.stay_type, conv.nights);
 
-  // ✅ FIX: 8am service-day rollover for start_date/end_date
-  const startDate = serviceDayISO({ rolloverHourLocal: 8 });
-  const endDate = addDaysISO(startDate, conv.nights || 1);
+  const today = new Date();
+  const startDate = today.toISOString().slice(0, 10);
+  const end = new Date(today);
+  end.setDate(end.getDate() + (conv.nights || 1));
+  const endDate = end.toISOString().slice(0, 10);
 
   const { data: booking, error: bookingErr } = await supabase
     .from("bookings")
@@ -244,10 +153,8 @@ export async function createBooking(conversation) {
     metadata: {
       booking_id: booking.id,
     },
-    success_url:
-      process.env.CHECKOUT_SUCCESS_URL || "https://openyardpark.com",
-    cancel_url:
-      process.env.CHECKOUT_CANCEL_URL || "https://openyardpark.com",
+    success_url: process.env.CHECKOUT_SUCCESS_URL || "https://openyardpark.com",
+    cancel_url: process.env.CHECKOUT_CANCEL_URL || "https://openyardpark.com",
   });
 
   await supabase
@@ -354,13 +261,12 @@ export async function stripeWebhookHandler(req, res) {
 
     const lotName = lot?.name || "OpenYard lot";
     const lotCode = lot?.lot_code || "";
+
     const addressRaw = lot ? buildLotAddress(lot) : "";
     const addressLine =
       addressRaw && hasMeaningfulAddress(addressRaw) ? addressRaw : "";
 
-    const nav = lot
-      ? buildNavigateLink(lot)
-      : { url: "", gpsLine: "", used: "name" };
+    const nav = lot ? buildNavigateLink(lot) : { url: "", gpsLine: "", used: "name" };
     const navigateUrl = nav.url || "https://www.google.com/maps";
     const gpsLine = nav.gpsLine || "";
 
