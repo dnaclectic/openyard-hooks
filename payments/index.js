@@ -65,6 +65,46 @@ function templateConfirmation({
   return lines.join("\n");
 }
 
+function isoDate(d) {
+  return new Date(d).toISOString().slice(0, 10);
+}
+
+function addDaysIso(startIso, days) {
+  // Use UTC math so it’s stable; we’re treating dates as date-only
+  const d = new Date(startIso + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  return isoDate(d);
+}
+
+async function getStallsLeftTonight(lotId) {
+  try {
+    const { data, error } = await supabase.rpc("openyard_stalls_left", {
+      p_lot_id: lotId,
+      // p_date omitted => function uses lot timezone "today"
+    });
+    if (error) throw error;
+    return typeof data === "number" ? data : null;
+  } catch (err) {
+    console.error("RPC openyard_stalls_left error:", err);
+    return null;
+  }
+}
+
+async function getMinStallsLeftForStay(lotId, startDate, endDate) {
+  try {
+    const { data, error } = await supabase.rpc("openyard_stalls_left_range", {
+      p_lot_id: lotId,
+      p_start_date: startDate,
+      p_end_date: endDate,
+    });
+    if (error) throw error;
+    return typeof data === "number" ? data : null;
+  } catch (err) {
+    console.error("RPC openyard_stalls_left_range error:", err);
+    return null;
+  }
+}
+
 export async function createBooking(conversation) {
   const { data: conv, error: convErr } = await supabase
     .from("conversations")
@@ -94,11 +134,37 @@ export async function createBooking(conversation) {
 
   const pricing = computePricing(lot, conv.stay_type, conv.nights);
 
-  const today = new Date();
-  const startDate = today.toISOString().slice(0, 10);
-  const end = new Date(today);
-  end.setDate(end.getDate() + (conv.nights || 1));
-  const endDate = end.toISOString().slice(0, 10);
+  // Dates (date-only)
+  const nights = Number(conv.nights || 1);
+  const startDate = isoDate(new Date());
+  const endDate = addDaysIso(startDate, nights);
+
+  // ---- CAPACITY GUARD (prevents Stripe/booking when sold out) ----
+  let minSpots = null;
+
+  if (nights <= 1) {
+    minSpots = await getStallsLeftTonight(lot.id);
+  } else {
+    minSpots = await getMinStallsLeftForStay(lot.id, startDate, endDate);
+  }
+
+  // If RPC failed, we fail OPEN (don’t block), but alert you.
+  if (minSpots === null) {
+    await notifyOwnerAlert(
+      `Capacity check failed (RPC returned null). Lot ${lot.lot_code || lot.id}`
+    );
+  }
+
+  // If capacity check succeeded and is 0, block checkout
+  if (typeof minSpots === "number" && minSpots <= 0) {
+    const msg =
+      `That lot is sold out for your dates (${startDate} to ${endDate}).\n` +
+      `Reply BOOK to start over, or reply SUPPORT for help.`;
+
+    await logSms(conv.id, conv.driver_phone_e164, "outbound", msg);
+    return msg;
+  }
+  // ---------------------------------------------------------------
 
   const { data: booking, error: bookingErr } = await supabase
     .from("bookings")
@@ -111,7 +177,7 @@ export async function createBooking(conversation) {
       truck_make_model: conv.truck_make_model,
       license_plate_raw: conv.license_plate_raw,
       stay_type: conv.stay_type,
-      nights: conv.nights,
+      nights: nights,
       start_date: startDate,
       end_date: endDate,
       nightly_rate_cents: pricing.nightly_rate_cents,
@@ -145,7 +211,7 @@ export async function createBooking(conversation) {
           unit_amount: pricing.total_cents,
           product_data: {
             name: `Truck Parking – ${lot.name}`,
-            description: `${conv.nights} night(s) at ${lot.name}`,
+            description: `${nights} night(s) at ${lot.name}`,
           },
         },
       },
@@ -173,7 +239,7 @@ export async function createBooking(conversation) {
   const payMsg = templatePaymentLink({
     lotName: lot?.name || "OpenYard lot",
     lotCode: lot?.lot_code || "",
-    nights: Number(conv.nights || 1),
+    nights: nights,
     totalCents: pricing.total_cents,
     url: session.url,
   });
@@ -266,7 +332,9 @@ export async function stripeWebhookHandler(req, res) {
     const addressLine =
       addressRaw && hasMeaningfulAddress(addressRaw) ? addressRaw : "";
 
-    const nav = lot ? buildNavigateLink(lot) : { url: "", gpsLine: "", used: "name" };
+    const nav = lot
+      ? buildNavigateLink(lot)
+      : { url: "", gpsLine: "", used: "name" };
     const navigateUrl = nav.url || "https://www.google.com/maps";
     const gpsLine = nav.gpsLine || "";
 
