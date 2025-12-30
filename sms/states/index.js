@@ -1,6 +1,6 @@
 // sms/states/index.js
 import "dotenv/config";
-import { supabase, updateConversation } from "../../db/db.js";
+import { supabase, updateConversation, logSms } from "../../db/db.js";
 import { computePricing, notifyOwnerAlert } from "../../utils/index.js";
 import { formatDateRange } from "../../utils/lotLinks.js";
 
@@ -39,8 +39,7 @@ function parseCityState(raw) {
 }
 
 async function findLotsByCodeOrSlug(raw) {
-  // Try slug/lot_code exact-ish match
-  const slugCandidate = raw.toLowerCase().replace(/\s+/g, "-");
+  const slugCandidate = String(raw || "").toLowerCase().replace(/\s+/g, "-");
 
   const { data, error } = await supabase
     .from("lots")
@@ -62,6 +61,35 @@ async function findLotsByCityState(city, state) {
   if (error) console.error("Error fetching lots (city/state):", error);
 
   return data || [];
+}
+
+async function getStallsLeftToday(lotId) {
+  try {
+    const { data, error } = await supabase.rpc("openyard_stalls_left", {
+      p_lot_id: lotId,
+      p_date: null, // let the function compute "today" in the lot timezone
+    });
+
+    if (error) {
+      console.error("RPC openyard_stalls_left error:", error);
+      return null; // treat as unknown, don't hard-block
+    }
+
+    // Supabase RPC returns the scalar directly in `data`
+    const n = Number(data);
+    if (!Number.isFinite(n)) return null;
+    return n;
+  } catch (err) {
+    console.error("getStallsLeftToday exception:", err);
+    return null;
+  }
+}
+
+function soldOutMessage(lotName) {
+  return (
+    `⚠️ ${lotName || "That lot"} is sold out tonight.\n\n` +
+    "Reply with another city/state to see nearby lots, or text BOOK to start over."
+  );
 }
 
 export async function handleLocationState(conversation, text) {
@@ -89,15 +117,24 @@ export async function handleLocationState(conversation, text) {
   if (lots.length === 1) {
     const lot = lots[0];
 
+    // Stall gate (Option A: only nightly/today matters)
+    const stallsLeft = await getStallsLeftToday(lot.id);
+    if (stallsLeft !== null && stallsLeft <= 0) {
+      return soldOutMessage(lot.name);
+    }
+
     await updateConversation(conversation.id, {
       lot_id: lot.id,
       current_state: "awaiting_name",
     });
 
+    const suffix =
+      stallsLeft !== null ? `\nStalls left tonight: ${stallsLeft}` : "";
+
     return (
       `You’re booking: ${lot.name}${
         lot.region_label ? " – " + lot.region_label : ""
-      }.\n\n` + "What’s your first and last name?"
+      }.${suffix}\n\n` + "What’s your first and last name?"
     );
   }
 
@@ -136,15 +173,24 @@ export async function handleLotChoiceState(conversation, text) {
 
   const chosen = limited[n - 1];
 
+  // Stall gate (Option A: only nightly/today matters)
+  const stallsLeft = await getStallsLeftToday(chosen.id);
+  if (stallsLeft !== null && stallsLeft <= 0) {
+    return soldOutMessage(chosen.name);
+  }
+
   await updateConversation(conversation.id, {
     lot_id: chosen.id,
     current_state: "awaiting_name",
   });
 
+  const suffix =
+    stallsLeft !== null ? `\nStalls left tonight: ${stallsLeft}` : "";
+
   return (
     `You’re booking: ${chosen.name}${
       chosen.region_label ? " – " + chosen.region_label : ""
-    }.\n\n` + "What’s your first and last name?"
+    }.${suffix}\n\n` + "What’s your first and last name?"
   );
 }
 
