@@ -38,6 +38,7 @@ async function findLotsByCodeOrSlug(raw) {
     .from("lots")
     .select("*")
     .eq("is_active", true)
+    .eq("accepting_bookings", true) // ✅ respect global pause toggle
     .or(`lot_code.ilike.${raw},slug.ilike.${slugCandidate}`);
 
   if (error) console.error("Error fetching lots (slug/code):", error);
@@ -45,7 +46,11 @@ async function findLotsByCodeOrSlug(raw) {
 }
 
 async function findLotsByCityState(city, state) {
-  let q = supabase.from("lots").select("*").eq("is_active", true);
+  let q = supabase
+    .from("lots")
+    .select("*")
+    .eq("is_active", true)
+    .eq("accepting_bookings", true); // ✅ respect global pause toggle
 
   if (city) q = q.ilike("city", `${city}%`);
   if (state) q = q.ilike("state", `${state}%`);
@@ -114,7 +119,7 @@ export async function handleLocationState(conversation, text) {
 
   if (!lots || lots.length === 0) {
     return (
-      "I couldn't find any lots near that.\n" +
+      "I couldn't find any available lots near that.\n" +
       'Try a city and state (e.g. "Bozeman MT" or "Kansas City MO").'
     );
   }
@@ -130,8 +135,7 @@ export async function handleLocationState(conversation, text) {
       return (
         `Sorry — ${lot.name}${
           lot.region_label ? " – " + lot.region_label : ""
-        } is sold out tonight.\n\n` +
-        'Try another city/state, or text SUPPORT.'
+        } is sold out tonight.\n\n` + 'Try another city/state, or text SUPPORT.'
       );
     }
 
@@ -499,3 +503,4 @@ export async function handleAwaitingPaymentState(conversation, trimmedUpper) {
     );
   }
 }
+```0
