@@ -15,9 +15,7 @@ import {
   formatDateRange,
 } from "../utils/lotLinks.js";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: "2023-10-16",
-});
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // How long a stall is “held” while driver completes Stripe checkout
 const HOLD_MINUTES = Number(process.env.BOOKING_HOLD_MINUTES || 10);
