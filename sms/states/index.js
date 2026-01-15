@@ -470,9 +470,7 @@ export async function handleAwaitingPaymentState(conversation, trimmedUpper) {
   try {
     const stripeSessionId = booking.stripe_session_id;
     const { default: Stripe } = await import("stripe");
-    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-      apiVersion: "2023-10-16",
-    });
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
     const session = await stripe.checkout.sessions.retrieve(stripeSessionId);
     if (!session || !session.url) {
